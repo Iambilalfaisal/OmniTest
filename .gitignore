@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Env
+.env
+.env.local
+*.env
+
+# Evidence artifacts (traces, videos, screenshots)
+backend/evidence/*
+!backend/evidence/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
