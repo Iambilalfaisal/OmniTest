@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import os
 
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.store.base import BaseStore
 
 from ..core.memory import MEMORY_NAMESPACE, domain_of, format_memories_for_prompt
 from ..core.models import TestPlan
@@ -32,12 +33,14 @@ Accessibility tree:
 
 def _planner_llm():
     # Constructed lazily so importing this module (e.g. at API startup) doesn't
-    # require OPENAI_API_KEY until a run actually reaches the planner node.
+    # require GOOGLE_API_KEY until a run actually reaches the planner node.
     # PLANNER_MODEL is required with no fallback — set it explicitly in .env.
-    return ChatOpenAI(model=os.environ["PLANNER_MODEL"], temperature=0).with_structured_output(TestPlan)
+    return ChatGoogleGenerativeAI(model=os.environ["PLANNER_MODEL"], temperature=0).with_structured_output(
+        TestPlan
+    )
 
 
-async def _retrieve_memory_context(target_url: str, instruction: str, store) -> str:
+async def _retrieve_memory_context(target_url: str, instruction: str, store: BaseStore | None) -> str:
     if store is None:
         return "No prior learnings recorded for this site yet.\n"
     domain = domain_of(target_url)
@@ -45,7 +48,7 @@ async def _retrieve_memory_context(target_url: str, instruction: str, store) -> 
     return format_memories_for_prompt(items)
 
 
-async def planner_node(state: QAState, *, store=None) -> dict:
+async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dict:
     client = create_playwright_client()
     tools = await get_playwright_tools(client)
     tree = await get_accessibility_snapshot(tools, state["target_url"])

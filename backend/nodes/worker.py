@@ -15,7 +15,7 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy, interrupt
 from pydantic import BaseModel, Field
@@ -84,7 +84,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
             ),
         ]
 
-    model = ChatOpenAI(model=os.environ["WORKER_MODEL"], temperature=0)
+    model = ChatGoogleGenerativeAI(model=os.environ["WORKER_MODEL"], temperature=0)
     response = await model.bind_tools(tools).ainvoke(messages)
 
     return {
@@ -139,7 +139,7 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
     session_key = _session_key(config, test_case.test_id)
     _, _, tool_map = await _get_session(session_key)
 
-    model = ChatOpenAI(model=os.environ["WORKER_MODEL"], temperature=0)
+    model = ChatGoogleGenerativeAI(model=os.environ["WORKER_MODEL"], temperature=0)
     verdict: Verdict = await model.with_structured_output(Verdict).ainvoke(
         state["messages"] + [HumanMessage("Give your final verdict on this test case now.")]
     )

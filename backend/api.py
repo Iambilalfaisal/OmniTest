@@ -3,18 +3,27 @@ progress (including human-in-the-loop pauses) by polling checkpointed state.
 """
 from __future__ import annotations
 
+import asyncio
+import sys
+
+# Must happen before any event loop is created (i.e. before uvicorn/anything else
+# touches asyncio) — psycopg's async mode raises on Windows' default ProactorEventLoop
+# ("Psycopg cannot use the 'ProactorEventLoop' to run in async mode"), which would
+# otherwise break both the checkpointer and core/memory.py's PostgresMemoryStore at
+# startup. Confirmed by hitting this directly while testing on Windows.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Loaded before the graph/node imports below, since those transitively construct
 # LangChain/LangSmith clients that read OPENAI_API_KEY / LANGCHAIN_* from os.environ.
 from dotenv import load_dotenv
 
 load_dotenv()
-
-import asyncio
 import json
 import logging
 import os
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -39,7 +48,22 @@ SSE_POLL_INTERVAL_SECONDS = float(os.getenv("SSE_POLL_INTERVAL_SECONDS", "1.0"))
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Graph construction can't happen at bare module-import time — building the
     # async Postgres saver/store needs a running event loop.
-    async with make_checkpointer() as checkpointer, make_store() as store:
+    async with AsyncExitStack() as stack:
+        checkpointer = await stack.enter_async_context(make_checkpointer())
+
+        store = None
+        try:
+            store = await stack.enter_async_context(make_store())
+        except Exception:
+            # pgvector is confirmed installed/enabled, so this should rarely trip —
+            # kept as a safety net (e.g. a transient connection failure) rather than
+            # removed. Degrade gracefully rather than block startup — planner_node/
+            # memory_node already handle store=None (no memory context / no-op write).
+            logging.exception(
+                "Long-term memory store unavailable — continuing without it; "
+                "runs will work, just without cross-run memory."
+            )
+
         app.state.graph = build_graph(checkpointer, store=store)
         yield
 
@@ -87,13 +111,10 @@ def _model_dump(value):
 
 
 def _pending_interrupts(snapshot) -> list[dict]:
-    # TODO(verify): Interrupt.id / .value field names, and snapshot.tasks[*].interrupts
-    # shape, against the installed langgraph version — see the plan's verify list.
-    pending = []
-    for task in snapshot.tasks:
-        for intr in getattr(task, "interrupts", ()) or ():
-            pending.append({"id": intr.id, "type": intr.value.get("type"), "payload": intr.value})
-    return pending
+    # Confirmed against the installed langgraph: StateSnapshot.interrupts is a
+    # top-level tuple[Interrupt, ...] (aggregated across all tasks), and Interrupt
+    # has exactly .id / .value fields.
+    return [{"id": intr.id, "type": intr.value.get("type"), "payload": intr.value} for intr in snapshot.interrupts]
 
 
 @app.post("/runs", response_model=RunHandle)

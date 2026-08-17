@@ -6,14 +6,15 @@ swallowed rather than propagated.
 from __future__ import annotations
 
 import logging
-import uuid
+
+from langchain_core.messages import HumanMessage
+from langgraph.store.base import BaseStore
 
 from ..core.memory import MEMORY_NAMESPACE, domain_of, get_memory_manager
-from ..core.models import SiteMemory
 from ..core.state import QAState
 
 
-async def memory_node(state: QAState, *, store=None) -> dict:
+async def memory_node(state: QAState, *, store: BaseStore | None = None) -> dict:
     if store is None:
         return {}
 
@@ -29,12 +30,12 @@ async def memory_node(state: QAState, *, store=None) -> dict:
             transcript_lines.append(f"Goal: {test_case.goal}\nStatus: {result.status}\nReason: {result.reason}\n")
         transcript = "\n".join(transcript_lines)
 
-        # TODO(verify): return shape of create_memory_manager(...).ainvoke(...) — assumed
-        # to be a list of SiteMemory-like items or plain dicts matching that schema.
-        extracted = await get_memory_manager().ainvoke({"messages": [{"role": "user", "content": transcript}]})
+        # create_memory_manager(...).ainvoke(...) returns list[ExtractedMemory], a
+        # NamedTuple of (id, content) — content is already the SiteMemory instance
+        # langmem constructed (confirmed against the installed langmem 0.0.30).
+        extracted = await get_memory_manager().ainvoke({"messages": [HumanMessage(transcript)]})
         for item in extracted:
-            memory = item if isinstance(item, SiteMemory) else SiteMemory(**item)
-            await store.aput((MEMORY_NAMESPACE, domain), str(uuid.uuid4()), memory.model_dump())
+            await store.aput((MEMORY_NAMESPACE, domain), item.id, item.content.model_dump())
     except Exception:
         logging.exception("memory_node failed for %s — run's report is unaffected", state.get("target_url"))
 

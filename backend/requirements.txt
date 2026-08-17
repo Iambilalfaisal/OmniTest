@@ -1,10 +1,10 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 langgraph>=0.2  # needs interrupt()/Command/RetryPolicy/max_concurrency support — verify this floor actually includes them, bump if not
-langgraph-checkpoint-postgres  # AsyncPostgresSaver + (believed) AsyncPostgresStore — verify both live here on install
+langgraph-checkpoint-postgres  # AsyncPostgresSaver + AsyncPostgresStore (confirmed both live here) — checkpointing + pgvector long-term memory
 psycopg[binary,pool]>=3.1  # async driver + pool backing AsyncPostgresSaver/AsyncPostgresStore
 langchain-mcp-adapters>=0.1
-langchain-openai>=0.2
+langchain-google-genai  # ChatGoogleGenerativeAI + GoogleGenerativeAIEmbeddings (Gemini)
 langchain-core>=0.3
 langmem  # long-term memory extraction — pin an actual released version once confirmed on PyPI
 pydantic>=2.8
@@ -12,6 +12,7 @@ sse-starlette>=2.1
 python-dotenv>=1.0
 langsmith>=0.1
 
-# Uncomment to use ANTHROPIC_API_KEY instead of OPENAI_API_KEY (see .env.example) —
-# swap ChatOpenAI for ChatAnthropic in nodes/planner.py and nodes/worker.py too.
-# langchain-anthropic>=0.3
+# Alternative providers — uncomment + swap the model classes in nodes/planner.py,
+# nodes/worker.py, and core/memory.py if you switch away from Gemini:
+# langchain-openai>=0.2      # ChatOpenAI / OpenAIEmbeddings, needs OPENAI_API_KEY
+# langchain-anthropic>=0.3   # ChatAnthropic, needs ANTHROPIC_API_KEY (no embeddings offering)
