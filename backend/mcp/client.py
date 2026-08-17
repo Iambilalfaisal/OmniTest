@@ -12,7 +12,11 @@ import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
-PLAYWRIGHT_MCP_ARGS = os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp").split()
+# --isolated is required, not optional, given our design: @playwright/mcp defaults to a
+# PERSISTENT shared browser profile, but we spin up one subprocess per parallel worker —
+# without --isolated, concurrent workers would fight over the same profile directory
+# instead of getting independent browsers. See https://playwright.dev/docs/getting-started-mcp.
+PLAYWRIGHT_MCP_ARGS = os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated").split()
 
 
 def create_playwright_client() -> MultiServerMCPClient:

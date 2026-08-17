@@ -1,6 +1,8 @@
 """Pydantic schemas for the planner's structured output and each worker's result."""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -23,3 +25,11 @@ class TestResult(BaseModel):
     trace_path: str | None
     video_path: str | None
     reason: str
+
+
+class SiteMemory(BaseModel):
+    """A single distilled fact about a target site, persisted to the long-term store."""
+
+    kind: Literal["failure_pattern", "site_quirk"]
+    summary: str = Field(description="One or two sentence distilled memory, phrased for reuse in a future planning prompt")
+    related_goal: str | None = Field(default=None, description="The TestCase.goal this relates to, if applicable (failure_pattern only)")

@@ -1,4 +1,6 @@
-"""FastAPI server: kicks off graph runs and streams node-by-node progress over SSE."""
+"""FastAPI server: drives graph runs in the background and lets clients observe
+progress (including human-in-the-loop pauses) by polling checkpointed state.
+"""
 from __future__ import annotations
 
 # Loaded before the graph/node imports below, since those transitively construct
@@ -7,24 +9,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import asyncio
 import json
+import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from .core.memory import make_store
 from .core.state import QAState
 from .graph.builder import build_graph
+from .graph.checkpointer import make_checkpointer
 
 EVIDENCE_DIR = Path(__file__).resolve().parent / "evidence"
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
+SSE_POLL_INTERVAL_SECONDS = float(os.getenv("SSE_POLL_INTERVAL_SECONDS", "1.0"))
 
-app = FastAPI(title="OmniTest Engine")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Graph construction can't happen at bare module-import time — building the
+    # async Postgres saver/store needs a running event loop.
+    async with make_checkpointer() as checkpointer, make_store() as store:
+        app.state.graph = build_graph(checkpointer, store=store)
+        yield
+
+
+app = FastAPI(title="OmniTest Engine", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -32,10 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/evidence", StaticFiles(directory=str(EVIDENCE_DIR)), name="evidence")
-
-graph = build_graph()
-_runs: dict[str, dict] = {}  # run_id -> {"target_url": ..., "instruction": ...}
-_reports: dict[str, dict] = {}  # run_id -> {"summary": ..., "test_results": [...]}, once finished
 
 
 class RunRequest(BaseModel):
@@ -47,59 +63,142 @@ class RunHandle(BaseModel):
     run_id: str
 
 
+class ResumeRequest(BaseModel):
+    resume: dict[str, dict]
+
+
+def _run_config(run_id: str) -> dict:
+    return {"configurable": {"thread_id": run_id}, "max_concurrency": MAX_CONCURRENT_WORKERS}
+
+
+async def _drive(graph, input_, config: dict) -> None:
+    """Runs the graph to completion or its next pause. Fire-and-forget from a route
+    handler — a crash here (retries exhausted) leaves the checkpoint stalled with
+    nothing automatically re-driving it; see the plan's accepted limitations.
+    """
+    try:
+        await graph.ainvoke(input_, config=config)
+    except Exception:
+        logging.exception("run %s crashed", config["configurable"]["thread_id"])
+
+
+def _model_dump(value):
+    return value.model_dump() if hasattr(value, "model_dump") else value
+
+
+def _pending_interrupts(snapshot) -> list[dict]:
+    # TODO(verify): Interrupt.id / .value field names, and snapshot.tasks[*].interrupts
+    # shape, against the installed langgraph version — see the plan's verify list.
+    pending = []
+    for task in snapshot.tasks:
+        for intr in getattr(task, "interrupts", ()) or ():
+            pending.append({"id": intr.id, "type": intr.value.get("type"), "payload": intr.value})
+    return pending
+
+
 @app.post("/runs", response_model=RunHandle)
-async def start_run(req: RunRequest) -> RunHandle:
+async def start_run(req: RunRequest, request: Request) -> RunHandle:
     run_id = str(uuid.uuid4())
-    _runs[run_id] = {"target_url": req.target_url, "instruction": req.instruction}
+    initial_state: QAState = {
+        "target_url": req.target_url,
+        "instruction": req.instruction,
+        "test_cases": [],
+        "test_results": [],
+        "summary": {},
+        "plan_approved": False,
+    }
+    asyncio.create_task(_drive(request.app.state.graph, initial_state, _run_config(run_id)))
     return RunHandle(run_id=run_id)
 
 
+@app.post("/runs/{run_id}/resume")
+async def resume_run(run_id: str, req: ResumeRequest, request: Request) -> dict:
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": run_id}}
+    snapshot = await graph.aget_state(config)
+    if not snapshot.values:
+        raise HTTPException(status_code=404, detail="unknown run_id")
+
+    pending_ids = {i["id"] for i in _pending_interrupts(snapshot)}
+    resume_ids = set(req.resume.keys())
+    if pending_ids != resume_ids:
+        # Exact-match, not just coverage: a checkpoint can have multiple simultaneous
+        # pending interrupts (e.g. two parallel workers each hitting a risky action in
+        # the same superstep) and Command(resume=...) must resolve all of them at once.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "resume payload must cover exactly the currently-pending interrupts",
+                "missing": sorted(pending_ids - resume_ids),
+                "unknown": sorted(resume_ids - pending_ids),
+            },
+        )
+
+    asyncio.create_task(_drive(graph, Command(resume=req.resume), _run_config(run_id)))
+    return {"status": "resumed", "run_id": run_id}
+
+
 @app.get("/runs/{run_id}/events")
-async def run_events(run_id: str) -> EventSourceResponse:
-    run = _runs.get(run_id)
-    if run is None:
+async def run_events(run_id: str, request: Request) -> EventSourceResponse:
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": run_id}}
+
+    snapshot = await graph.aget_state(config)
+    if not snapshot.values:
         raise HTTPException(status_code=404, detail="unknown run_id")
 
     async def event_stream() -> AsyncIterator[dict]:
-        # MVP: the graph executes once per SSE connection; a client reconnect
-        # would start a fresh run rather than resuming the in-flight one.
-        initial_state: QAState = {
-            "target_url": run["target_url"],
-            "instruction": run["instruction"],
-            "test_cases": [],
-            "test_results": [],
-            "summary": {},
-        }
-        final_results = []
-        async for event in graph.astream(initial_state, stream_mode="updates"):
-            node_name, payload = next(iter(event.items()))
-            yield {"event": node_name, "data": _to_json(payload)}
-            if node_name == "worker_node":
-                final_results.extend(payload["test_results"])
-            if node_name == "reporter_node":
-                _reports[run_id] = {
-                    "summary": payload["summary"],
-                    "test_results": [r.model_dump() for r in final_results],
+        emitted_interrupt_ids: frozenset = frozenset()
+        while True:
+            snapshot = await graph.aget_state(config)
+            pending = _pending_interrupts(snapshot)
+            pending_ids = frozenset(i["id"] for i in pending)
+
+            if pending_ids and pending_ids != emitted_interrupt_ids:
+                emitted_interrupt_ids = pending_ids
+                yield {"event": "paused", "data": json.dumps({"interrupts": pending})}
+            elif not snapshot.next:
+                yield {
+                    "event": "done",
+                    "data": json.dumps(
+                        {
+                            "summary": snapshot.values.get("summary", {}),
+                            "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
+                            "plan_approved": snapshot.values.get("plan_approved", False),
+                        }
+                    ),
                 }
+                return
+            elif not pending_ids:
+                yield {
+                    "event": "progress",
+                    "data": json.dumps(
+                        {
+                            "test_cases": [_model_dump(tc) for tc in snapshot.values.get("test_cases", [])],
+                            "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
+                        }
+                    ),
+                }
+
+            await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
 
     return EventSourceResponse(event_stream())
 
 
 @app.get("/runs/{run_id}/report")
-async def get_report(run_id: str) -> dict:
-    report = _reports.get(run_id)
-    if report is None:
+async def get_report(run_id: str, request: Request) -> dict:
+    graph = request.app.state.graph
+    snapshot = await graph.aget_state({"configurable": {"thread_id": run_id}})
+    if not snapshot.values:
+        raise HTTPException(status_code=404, detail="unknown run_id")
+    if snapshot.next:
         raise HTTPException(status_code=404, detail="run not finished yet")
-    return report
 
-
-def _to_json(payload: dict) -> str:
-    def default(value):
-        if hasattr(value, "model_dump"):
-            return value.model_dump()
-        return str(value)
-
-    return json.dumps(payload, default=default)
+    return {
+        "summary": snapshot.values.get("summary", {}),
+        "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
+        "plan_approved": snapshot.values.get("plan_approved", False),
+    }
 
 
 if __name__ == "__main__":
