@@ -53,7 +53,15 @@ async def _get_session(session_key: str) -> tuple:
     if session_key not in _SESSIONS:
         client = create_playwright_client()
         tools = await get_playwright_tools(client)
-        _SESSIONS[session_key] = (client, tools, {t.name: t for t in tools})
+        tool_map = {t.name: t for t in tools}
+        # Started once per session (--caps=devtools tools, gated in mcp/client.py) so
+        # they cover the whole test case; stopped + captured in verdict_node, just
+        # before browser_close. Guarded with .get() in case --caps=devtools isn't set.
+        if tool_map.get("browser_start_tracing") is not None:
+            await tool_map["browser_start_tracing"].ainvoke({})
+        if tool_map.get("browser_start_video") is not None:
+            await tool_map["browser_start_video"].ainvoke({})
+        _SESSIONS[session_key] = (client, tools, tool_map)
     return _SESSIONS[session_key]
 
 
@@ -136,7 +144,14 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         state["messages"] + [HumanMessage("Give your final verdict on this test case now.")]
     )
 
-    screenshot_path = await _capture_screenshot(tool_map, session_key)
+    # session_key contains ":" (invalid in a Windows path component) — sanitize for the dir name.
+    run_dir = EVIDENCE_DIR / session_key.replace(":", "_")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    screenshot_path = await _capture_screenshot(tool_map, run_dir)
+    trace_path = await _stop_and_capture(tool_map, "browser_stop_tracing", run_dir / "trace.zip")
+    video_path = await _stop_and_capture(tool_map, "browser_stop_video", run_dir / "video.webm")
+
     close_tool = tool_map.get("browser_close")
     if close_tool is not None:
         await close_tool.ainvoke({})
@@ -148,20 +163,28 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
                 test_id=test_case.test_id,
                 status=verdict.status,
                 screenshot_path=screenshot_path,
-                trace_path=None,  # TODO(verify): see mcp/client.py — trace/video capture unconfirmed
-                video_path=None,
+                trace_path=trace_path,
+                video_path=video_path,
                 reason=verdict.reason,
             )
         ]
     }
 
 
-async def _capture_screenshot(tool_map: dict, session_key: str) -> str:
-    # session_key contains ":" (invalid in a Windows path component) — sanitize for the dir name.
-    run_dir = EVIDENCE_DIR / session_key.replace(":", "_")
-    run_dir.mkdir(parents=True, exist_ok=True)
+async def _capture_screenshot(tool_map: dict, run_dir: Path) -> str:
     path = run_dir / "final.png"
     await tool_map["browser_take_screenshot"].ainvoke({"filename": str(path)})
+    return str(path.relative_to(EVIDENCE_DIR.parent))
+
+
+async def _stop_and_capture(tool_map: dict, tool_name: str, path: Path) -> str | None:
+    # TODO(verify): exact param name for browser_stop_tracing/browser_stop_video —
+    # assumed to match browser_take_screenshot's "filename" shape, unconfirmed against
+    # the tools' actual input schema. tool absent entirely if --caps=devtools isn't set.
+    tool = tool_map.get(tool_name)
+    if tool is None:
+        return None
+    await tool.ainvoke({"filename": str(path)})
     return str(path.relative_to(EVIDENCE_DIR.parent))
 
 

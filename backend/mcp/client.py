@@ -15,8 +15,15 @@ PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
 # --isolated is required, not optional, given our design: @playwright/mcp defaults to a
 # PERSISTENT shared browser profile, but we spin up one subprocess per parallel worker —
 # without --isolated, concurrent workers would fight over the same profile directory
-# instead of getting independent browsers. See https://playwright.dev/docs/getting-started-mcp.
-PLAYWRIGHT_MCP_ARGS = os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated").split()
+# instead of getting independent browsers.
+# --caps=devtools opts into browser_start_tracing/browser_start_video (+ stop_ variants)
+# for nodes/worker.py's evidence capture; it also exposes a few extra low-risk tools
+# (browser_annotate, browser_highlight, browser_resume, video-chapter tools) to the
+# worker LLM's tool-calling set as a side effect, since we bind everything indiscriminately.
+# See https://playwright.dev/docs/getting-started-mcp and https://github.com/microsoft/playwright-mcp.
+PLAYWRIGHT_MCP_ARGS = os.getenv(
+    "PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated --caps=devtools"
+).split()
 
 
 def create_playwright_client() -> MultiServerMCPClient:
