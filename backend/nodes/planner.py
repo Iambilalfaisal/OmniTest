@@ -5,6 +5,7 @@ ordered list of plain-language steps for a worker to execute.
 from __future__ import annotations
 
 import os
+from contextlib import AsyncExitStack
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.store.base import BaseStore
@@ -12,7 +13,7 @@ from langgraph.store.base import BaseStore
 from ..core.memory import MEMORY_NAMESPACE, domain_of, format_memories_for_prompt
 from ..core.models import TestPlan
 from ..core.state import QAState
-from ..mcp.client import create_playwright_client, get_accessibility_snapshot, get_playwright_tools
+from ..mcp.client import get_accessibility_snapshot, open_playwright_session
 
 PLANNER_PROMPT = """You are a QA engineer. Given the accessibility tree of a web page \
 and a testing instruction, write a small, high-value set of test cases that exercise \
@@ -49,9 +50,9 @@ async def _retrieve_memory_context(target_url: str, instruction: str, store: Bas
 
 
 async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dict:
-    client = create_playwright_client()
-    tools = await get_playwright_tools(client)
-    tree = await get_accessibility_snapshot(tools, state["target_url"])
+    async with AsyncExitStack() as stack:
+        tools = await open_playwright_session(stack)
+        tree = await get_accessibility_snapshot(tools, state["target_url"])
     memory_context = await _retrieve_memory_context(state["target_url"], state["instruction"], store)
 
     plan: TestPlan = await _planner_llm().ainvoke(

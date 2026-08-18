@@ -111,20 +111,35 @@ export default function ReportsPage() {
                           View trace
                         </button>
                       )}
-                      {result.screenshot_path && (
-                        <a
-                          href={`${API_BASE}/${result.screenshot_path}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="rounded-full border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-200"
-                        >
-                          Screenshot
-                        </a>
-                      )}
                     </div>
                   </div>
 
                   <p className="mt-3 text-sm leading-6 text-slate-300">{result.reason}</p>
+
+                  {result.screenshot_path && (
+                    <a
+                      href={`${API_BASE}/${result.screenshot_path}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-3 block overflow-hidden rounded-xl border border-white/10 bg-slate-950/60"
+                    >
+                      <img
+                        src={`${API_BASE}/${result.screenshot_path}`}
+                        alt={`Final screenshot for ${result.test_id}`}
+                        className="max-h-56 w-full object-contain"
+                        loading="lazy"
+                      />
+                    </a>
+                  )}
+
+                  {result.video_path && (
+                    <video
+                      src={`${API_BASE}/${result.video_path}`}
+                      controls
+                      preload="metadata"
+                      className="mt-3 w-full rounded-xl border border-white/10 bg-black"
+                    />
+                  )}
                 </div>
               ))}
             </div>

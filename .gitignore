@@ -19,6 +19,13 @@ out/
 backend/evidence/*
 !backend/evidence/.gitkeep
 
+# Playwright MCP's own working directory (page snapshots, traces, videos it
+# auto-saves outside our control — see backend/nodes/worker.py's evidence capture)
+.playwright-mcp/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
 # OS
 .DS_Store
 Thumbs.db

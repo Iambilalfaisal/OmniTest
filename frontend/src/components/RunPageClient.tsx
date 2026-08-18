@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import WorkerCard, { TestCase, TestResult } from "@/components/WorkerCard";
+import HumanReviewPanel, { PendingInterrupt, ResumeDecision } from "@/components/HumanReviewPanel";
+import TraceViewer from "@/components/TraceViewer";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const RECONNECT_DELAY_MS = 2000;
 
 export default function RunPageClient() {
   const runId = useSearchParams().get("id");
@@ -12,58 +15,112 @@ export default function RunPageClient() {
   const [results, setResults] = useState<Record<string, TestResult>>({});
   const [done, setDone] = useState(false);
   const [status, setStatus] = useState("Planning tests…");
+  const [pendingInterrupts, setPendingInterrupts] = useState<PendingInterrupt[]>([]);
+  const [resuming, setResuming] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
+  const [activeTrace, setActiveTrace] = useState<string | null>(null);
+
+  // Held in a ref (not state) so the effect below can read the current value in its
+  // cleanup/reconnect closures without re-subscribing the whole EventSource on every
+  // resume — resume is triggered by a plain POST, not by tearing down the stream.
+  const doneRef = useRef(false);
 
   useEffect(() => {
     if (!runId) return;
+    let cancelled = false;
+    let source: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const source = new EventSource(`${API_BASE}/runs/${runId}/events`);
+    function connect() {
+      if (cancelled) return;
+      source = new EventSource(`${API_BASE}/runs/${runId}/events`);
 
-    source.addEventListener("progress", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data);
-      if (payload.test_cases?.length) {
-        setPlan(payload.test_cases as TestCase[]);
-        setStatus("Executing browser checks…");
-      }
-      if (payload.test_results?.length) {
-        const incoming = payload.test_results as TestResult[];
+      source.addEventListener("progress", (event) => {
+        const payload = JSON.parse((event as MessageEvent).data);
+        setPendingInterrupts([]);
+        if (payload.test_cases?.length) {
+          setPlan(payload.test_cases as TestCase[]);
+          setStatus("Executing browser checks…");
+        }
+        if (payload.test_results?.length) {
+          const incoming = payload.test_results as TestResult[];
+          setResults((prev) => {
+            const next = { ...prev };
+            for (const result of incoming) {
+              next[result.test_id] = result;
+            }
+            return next;
+          });
+        }
+      });
+
+      source.addEventListener("paused", (event) => {
+        const payload = JSON.parse((event as MessageEvent).data);
+        const interrupts = (payload.interrupts ?? []) as PendingInterrupt[];
+        setPendingInterrupts(interrupts);
+        setResumeError(null);
+        setStatus(interrupts.length > 0 ? "Awaiting your review…" : "Paused");
+      });
+
+      source.addEventListener("done", (event) => {
+        const payload = JSON.parse((event as MessageEvent).data);
+        const incoming = payload.test_results ?? [];
+        setPendingInterrupts([]);
         setResults((prev) => {
           const next = { ...prev };
-          for (const result of incoming) {
+          for (const result of incoming as TestResult[]) {
             next[result.test_id] = result;
           }
           return next;
         });
-      }
-    });
-
-    source.addEventListener("paused", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data);
-      const interruptCount = payload.interrupts?.length ?? 0;
-      setStatus(interruptCount > 0 ? "Awaiting approval…" : "Paused");
-    });
-
-    source.addEventListener("done", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data);
-      const incoming = payload.test_results ?? [];
-      setResults((prev) => {
-        const next = { ...prev };
-        for (const result of incoming as TestResult[]) {
-          next[result.test_id] = result;
-        }
-        return next;
+        doneRef.current = true;
+        setDone(true);
+        setStatus("Completed");
+        source?.close();
       });
-      setDone(true);
-      setStatus("Completed");
-      source.close();
-    });
 
-    source.onerror = () => {
-      setStatus("Connection interrupted");
-      source.close();
+      source.onerror = () => {
+        source?.close();
+        if (cancelled || doneRef.current) return;
+        setStatus("Connection lost — reconnecting…");
+        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+      };
+    }
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      source?.close();
     };
-
-    return () => source.close();
   }, [runId]);
+
+  async function submitResume(resume: Record<string, ResumeDecision>, optimisticPlan?: TestCase[]) {
+    if (!runId) return;
+    setResuming(true);
+    setResumeError(null);
+    try {
+      const res = await fetch(`${API_BASE}/runs/${runId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Failed to submit your decision.");
+      }
+      if (optimisticPlan) {
+        setPlan(optimisticPlan);
+      }
+      setPendingInterrupts([]);
+      setStatus(optimisticPlan?.length === 0 ? "Plan rejected" : "Resuming…");
+    } catch (err) {
+      setResumeError(err instanceof Error ? err.message : "Failed to submit your decision.");
+    } finally {
+      setResuming(false);
+    }
+  }
 
   const stats = useMemo(() => {
     const total = plan.length;
@@ -71,6 +128,16 @@ export default function RunPageClient() {
     const failed = Object.values(results).filter((result) => result.status === "Fail").length;
     return { total, passed, failed };
   }, [plan, results]);
+
+  const riskyTestIds = useMemo(
+    () =>
+      new Set(
+        pendingInterrupts
+          .filter((i): i is Extract<PendingInterrupt, { type: "risky_action" }> => i.type === "risky_action")
+          .map((i) => i.payload.test_id)
+      ),
+    [pendingInterrupts]
+  );
 
   if (!runId) {
     return (
@@ -113,15 +180,37 @@ export default function RunPageClient() {
         </div>
       </header>
 
+      {pendingInterrupts.length > 0 && (
+        <HumanReviewPanel
+          interrupts={pendingInterrupts}
+          submitting={resuming}
+          error={resumeError}
+          onSubmit={submitResume}
+        />
+      )}
+
       <section className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
         {plan.length === 0 ? (
-          <div className="glass-panel col-span-full rounded-3xl p-8 text-center text-slate-300">
-            Planning your QA workflow…
-          </div>
+          pendingInterrupts.length === 0 && (
+            <div className="glass-panel col-span-full rounded-3xl p-8 text-center text-slate-300">
+              Planning your QA workflow…
+            </div>
+          )
         ) : (
-          plan.map((testCase) => <WorkerCard key={testCase.test_id} testCase={testCase} result={results[testCase.test_id]} />)
+          plan.map((testCase) => (
+            <WorkerCard
+              key={testCase.test_id}
+              testCase={testCase}
+              result={results[testCase.test_id]}
+              awaitingApproval={riskyTestIds.has(testCase.test_id)}
+              apiBase={API_BASE}
+              onViewTrace={setActiveTrace}
+            />
+          ))
         )}
       </section>
+
+      {activeTrace && <TraceViewer traceUrl={activeTrace} onClose={() => setActiveTrace(null)} />}
     </div>
   );
 }

@@ -16,15 +16,24 @@ if sys.platform == "win32":
 
 # Loaded before the graph/node imports below, since those transitively construct
 # LangChain/LangSmith clients that read OPENAI_API_KEY / LANGCHAIN_* from os.environ.
+#
+# Path is explicit (not load_dotenv()'s default search) because that search is
+# frame-based: it walks up from the caller's __file__ unless it decides it's running
+# "interactively", in which case it falls back to os.getcwd() instead. uvicorn
+# --reload on Windows launches the real server via multiprocessing's spawn method,
+# whose bootstrap process has no __main__.__file__ — dotenv's interactive-detection
+# trips on that and searches from cwd, which misses backend/.env entirely whenever
+# uvicorn is started from the repo root instead of from backend/.
+import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 import json
 import logging
-import os
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
-from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
@@ -38,6 +47,7 @@ from .core.memory import make_store
 from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
+from .nodes.worker import close_sessions_for_thread
 
 EVIDENCE_DIR = Path(__file__).resolve().parent / "evidence"
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
@@ -100,10 +110,16 @@ async def _drive(graph, input_, config: dict) -> None:
     handler — a crash here (retries exhausted) leaves the checkpoint stalled with
     nothing automatically re-driving it; see the plan's accepted limitations.
     """
+    thread_id = config["configurable"]["thread_id"]
     try:
         await graph.ainvoke(input_, config=config)
     except Exception:
-        logging.exception("run %s crashed", config["configurable"]["thread_id"])
+        logging.exception("run %s crashed", thread_id)
+    finally:
+        # No-op on the happy path (verdict_node already closed its own session) — this
+        # only matters when a crash left a worker's Playwright session cached but never
+        # closed, which would otherwise leak that browser subprocess forever.
+        await close_sessions_for_thread(thread_id)
 
 
 def _model_dump(value):
