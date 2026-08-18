@@ -1,82 +1,138 @@
 "use client";
 
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import TraceViewer from "@/components/TraceViewer";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 type TestResult = {
-  test_case_id: string;
-  title: string;
-  status: "passed" | "failed" | "error";
-  duration_ms: number;
+  test_id: string;
+  status: string;
+  screenshot_path: string;
   trace_path?: string | null;
+  video_path?: string | null;
+  reason: string;
 };
 
 type RunReport = {
-  run_id: string;
-  total: number;
-  passed: number;
-  failed: number;
-  errored: number;
-  duration_ms: number;
-  results: TestResult[];
+  summary: { total: number; passed: number; failed: number };
+  test_results: TestResult[];
+  plan_approved: boolean;
 };
 
 export default function ReportsPage() {
   const [runId, setRunId] = useState("");
   const [report, setReport] = useState<RunReport | null>(null);
   const [activeTrace, setActiveTrace] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  async function loadReport(e: React.FormEvent) {
+  async function loadReport(e: FormEvent) {
     e.preventDefault();
-    const res = await fetch(`${API_BASE}/runs/${runId}/report`);
-    if (res.ok) setReport(await res.json());
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/runs/${runId}/report`);
+      if (!res.ok) {
+        throw new Error("Unable to load report for this run.");
+      }
+      setReport(await res.json());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
-    <div className="flex flex-col gap-6">
-      <form onSubmit={loadReport} className="flex gap-2">
-        <input
-          value={runId}
-          onChange={(e) => setRunId(e.target.value)}
-          placeholder="Run ID"
-          className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2"
-        />
-        <button className="rounded bg-running px-4 py-2 font-medium text-white">Load</button>
-      </form>
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 py-4">
+      <div className="glass-panel rounded-3xl p-6">
+        <form onSubmit={loadReport} className="flex flex-col gap-4 md:flex-row">
+          <input
+            value={runId}
+            onChange={(e) => setRunId(e.target.value)}
+            placeholder="Paste a run ID"
+            className="flex-1 rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white outline-none transition focus:border-cyan-400/70 focus:ring-2 focus:ring-cyan-500/30"
+          />
+          <button
+            type="submit"
+            disabled={loading || !runId}
+            className="rounded-2xl bg-gradient-to-r from-violet-500 to-cyan-500 px-5 py-3 font-medium text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading ? "Loading…" : "Load report"}
+          </button>
+        </form>
+
+        {error && <div className="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{error}</div>}
+      </div>
 
       {report && (
         <>
-          <div className="flex gap-4 text-sm">
-            <span className="text-pass">{report.passed} passed</span>
-            <span className="text-fail">{report.failed} failed</span>
-            <span className="text-neutral-400">{report.duration_ms}ms total</span>
-          </div>
-          <ul className="flex flex-col divide-y divide-neutral-800">
-            {report.results.map((result) => (
-              <li key={result.test_case_id} className="flex items-center justify-between py-3">
-                <span>{result.title}</span>
-                <div className="flex items-center gap-3">
-                  <span className="text-xs uppercase text-neutral-400">{result.status}</span>
-                  {result.trace_path && (
-                    <button
-                      onClick={() => setActiveTrace(result.trace_path!)}
-                      className="text-xs text-running underline"
-                    >
-                      view trace
-                    </button>
-                  )}
+          <section className="grid gap-4 md:grid-cols-3">
+            <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-5">
+              <div className="text-xs uppercase tracking-[0.28em] text-slate-400">Total</div>
+              <div className="mt-3 text-3xl font-semibold text-white">{report.summary.total}</div>
+            </div>
+            <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5">
+              <div className="text-xs uppercase tracking-[0.28em] text-emerald-300/80">Passed</div>
+              <div className="mt-3 text-3xl font-semibold text-emerald-300">{report.summary.passed}</div>
+            </div>
+            <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-5">
+              <div className="text-xs uppercase tracking-[0.28em] text-rose-300/80">Failed</div>
+              <div className="mt-3 text-3xl font-semibold text-rose-300">{report.summary.failed}</div>
+            </div>
+          </section>
+
+          <section className="glass-panel rounded-3xl p-5 md:p-6">
+            <div className="mb-5 flex items-center justify-between">
+              <h2 className="text-xl font-semibold text-white">Test results</h2>
+              <span className="text-xs uppercase tracking-[0.25em] text-slate-400">
+                {report.plan_approved ? "Approved plan" : "Skipped approval"}
+              </span>
+            </div>
+
+            <div className="space-y-3">
+              {report.test_results.map((result) => (
+                <div key={result.test_id} className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <div className="text-sm uppercase tracking-[0.2em] text-slate-400">{result.test_id}</div>
+                      <div className="mt-1 text-lg font-medium text-white">{result.status}</div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {result.trace_path && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveTrace(`${API_BASE}/${result.trace_path}`)}
+                          className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200"
+                        >
+                          View trace
+                        </button>
+                      )}
+                      {result.screenshot_path && (
+                        <a
+                          href={`${API_BASE}/${result.screenshot_path}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="rounded-full border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-200"
+                        >
+                          Screenshot
+                        </a>
+                      )}
+                    </div>
+                  </div>
+
+                  <p className="mt-3 text-sm leading-6 text-slate-300">{result.reason}</p>
                 </div>
-              </li>
-            ))}
-          </ul>
+              ))}
+            </div>
+          </section>
         </>
       )}
 
-      {activeTrace && (
-        <TraceViewer traceUrl={`${API_BASE}/${activeTrace}`} onClose={() => setActiveTrace(null)} />
-      )}
+      {activeTrace && <TraceViewer traceUrl={activeTrace} onClose={() => setActiveTrace(null)} />}
     </div>
   );
 }

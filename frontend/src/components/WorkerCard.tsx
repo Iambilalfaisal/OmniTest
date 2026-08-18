@@ -1,17 +1,23 @@
-export type TestCase = { id: string; title: string; intent: string };
+export type TestCase = {
+  test_id: string;
+  goal: string;
+  steps: string[];
+};
 
 export type TestResult = {
-  test_case_id: string;
-  title: string;
-  status: "passed" | "failed" | "error";
-  duration_ms: number;
+  test_id: string;
+  status: string;
+  screenshot_path: string;
+  trace_path?: string | null;
+  video_path?: string | null;
+  reason: string;
 };
 
 const STATUS_STYLES: Record<string, string> = {
-  running: "border-running/50 bg-running/10 text-running",
-  passed: "border-pass/50 bg-pass/10 text-pass",
-  failed: "border-fail/50 bg-fail/10 text-fail",
-  error: "border-fail/50 bg-fail/10 text-fail",
+  running: "border-cyan-500/30 bg-cyan-500/10 text-cyan-300",
+  Pass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+  Fail: "border-rose-500/30 bg-rose-500/10 text-rose-300",
+  default: "border-slate-500/30 bg-slate-500/10 text-slate-300",
 };
 
 export default function WorkerCard({
@@ -24,13 +30,34 @@ export default function WorkerCard({
   const status = result?.status ?? "running";
 
   return (
-    <div className={`rounded-lg border p-4 ${STATUS_STYLES[status]}`}>
-      <div className="flex items-center justify-between">
-        <h3 className="font-medium text-neutral-100">{testCase.title}</h3>
-        <span className="text-xs uppercase tracking-wide">{status}</span>
+    <article className="glass-panel rounded-3xl p-5">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Test case</div>
+          <h3 className="mt-2 text-xl font-semibold text-white">{testCase.goal}</h3>
+        </div>
+        <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] ${STATUS_STYLES[status] ?? STATUS_STYLES.default}`}>
+          {status}
+        </span>
       </div>
-      <p className="mt-1 text-sm text-neutral-400">{testCase.intent}</p>
-      {result && <p className="mt-2 text-xs text-neutral-500">{result.duration_ms}ms</p>}
-    </div>
+
+      <div className="mt-5 space-y-3">
+        {testCase.steps.map((step, index) => (
+          <div key={`${testCase.test_id}-step-${index}`} className="flex items-start gap-3 rounded-2xl border border-white/5 bg-slate-950/35 px-3 py-2">
+            <div className="mt-0.5 flex h-6 w-6 items-center justify-center rounded-full bg-slate-800 text-[10px] font-semibold text-slate-200">
+              {index + 1}
+            </div>
+            <p className="text-sm leading-6 text-slate-300">{step}</p>
+          </div>
+        ))}
+      </div>
+
+      {result && (
+        <div className="mt-5 rounded-2xl border border-white/10 bg-slate-950/40 p-3">
+          <div className="text-[10px] uppercase tracking-[0.25em] text-slate-400">Verdict</div>
+          <p className="mt-2 text-sm leading-6 text-slate-200">{result.reason}</p>
+        </div>
+      )}
+    </article>
   );
 }

@@ -1,3 +1,39 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background:
+    radial-gradient(circle at top left, rgba(34, 211, 238, 0.2), transparent 24%),
+    radial-gradient(circle at top right, rgba(168, 85, 247, 0.18), transparent 28%),
+    linear-gradient(180deg, #020617 0%, #020817 100%);
+  min-height: 100vh;
+}
+
+@layer base {
+  * {
+    @apply box-border;
+  }
+
+  body {
+    @apply m-0 font-sans text-slate-100;
+  }
+
+  a {
+    @apply no-underline;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply border border-white/10 bg-slate-900/70 shadow-2xl shadow-slate-950/40 backdrop-blur-xl;
+  }
+}
