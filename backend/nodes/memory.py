@@ -27,7 +27,9 @@ async def memory_node(state: QAState, *, store: BaseStore | None = None) -> dict
             result = results_by_id.get(test_case.test_id)
             if result is None:
                 continue
-            transcript_lines.append(f"Goal: {test_case.goal}\nStatus: {result.status}\nReason: {result.reason}\n")
+            transcript_lines.append(
+                f"Goal: {test_case.goal}\nCategory: {test_case.category}\nStatus: {result.status}\nReason: {result.reason}\n"
+            )
         transcript = "\n".join(transcript_lines)
 
         # create_memory_manager(...).ainvoke(...) returns list[ExtractedMemory], a

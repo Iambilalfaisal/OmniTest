@@ -8,34 +8,34 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 export default function HomePage() {
   const router = useRouter();
   const [url, setUrl] = useState("https://example.com");
-  const [objective, setObjective] = useState("Verify the checkout flow handles an expired coupon code and surfaces a clear error message.");
+  const [startingIdea, setStartingIdea] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function startRun(e: FormEvent<HTMLFormElement>) {
+  async function startDiscovery(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSubmitting(true);
     setError(null);
 
     try {
-      const res = await fetch(`${API_BASE}/runs`, {
+      const res = await fetch(`${API_BASE}/discover`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           target_url: url,
-          instruction: objective,
+          starting_idea: startingIdea,
         }),
       });
 
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(text || "Unable to start a run.");
+        throw new Error(text || "Unable to start a discovery session.");
       }
 
-      const { run_id } = await res.json();
-      router.push(`/run?id=${run_id}`);
+      const { discovery_id } = await res.json();
+      router.push(`/discover?id=${discovery_id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong while starting the run.");
+      setError(err instanceof Error ? err.message : "Something went wrong while starting discovery.");
     } finally {
       setSubmitting(false);
     }
@@ -56,8 +56,8 @@ export default function HomePage() {
           </div>
 
           <p className="max-w-xl text-base leading-7 text-slate-300 md:text-lg">
-            Launch autonomous browser tests that reason like a quality engineer, inspect accessibility state,
-            validate user journeys, and report evidence in real time.
+            Give a URL and OmniTest explores the site, proposes a test plan grouped by feature — happy
+            paths, edge cases, and negative cases — and talks it through with you before anything runs.
           </p>
 
           <div className="mt-8 grid gap-4 sm:grid-cols-3">
@@ -77,15 +77,15 @@ export default function HomePage() {
         <div className="glass-panel rounded-3xl p-6 md:p-8">
           <div className="mb-5 flex items-center justify-between">
             <div>
-              <p className="text-xs uppercase tracking-[0.25em] text-slate-400">New run</p>
-              <h2 className="mt-2 text-2xl font-semibold text-white">Start validation</h2>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-400">New session</p>
+              <h2 className="mt-2 text-2xl font-semibold text-white">Explore &amp; plan</h2>
             </div>
             <div className="rounded-full border border-cyan-400/40 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300">
               Ready
             </div>
           </div>
 
-          <form onSubmit={startRun} className="space-y-5">
+          <form onSubmit={startDiscovery} className="space-y-5">
             <label className="block">
               <span className="mb-2 block text-sm text-slate-300">Target URL</span>
               <input
@@ -98,12 +98,11 @@ export default function HomePage() {
             </label>
 
             <label className="block">
-              <span className="mb-2 block text-sm text-slate-300">Testing instruction</span>
+              <span className="mb-2 block text-sm text-slate-300">Starting idea (optional)</span>
               <textarea
-                required
-                value={objective}
-                onChange={(e) => setObjective(e.target.value)}
-                placeholder="Verify the checkout flow handles an expired coupon code"
+                value={startingIdea}
+                onChange={(e) => setStartingIdea(e.target.value)}
+                placeholder="e.g. Verify the checkout flow — or leave blank and OmniTest will suggest what to test"
                 rows={5}
                 className="w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-base text-white outline-none transition focus:border-cyan-400/70 focus:ring-2 focus:ring-cyan-500/30"
               />
@@ -120,7 +119,7 @@ export default function HomePage() {
               disabled={submitting}
               className="inline-flex w-full items-center justify-center rounded-2xl bg-gradient-to-r from-cyan-500 via-blue-500 to-violet-500 px-5 py-3 text-base font-semibold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {submitting ? "Starting inspector…" : "Start QA run"}
+              {submitting ? "Exploring the site…" : "Start exploring"}
             </button>
           </form>
         </div>

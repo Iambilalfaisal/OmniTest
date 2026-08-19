@@ -12,17 +12,24 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langgraph.store.base import BaseStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langmem import create_memory_manager
 
-from .models import SiteMemory
+from .models import SiteMemory, SiteMap
 
 MEMORY_NAMESPACE = "site_memory"
 DATABASE_URL = os.environ["DATABASE_URL"]  # required — fail fast at import time
+
+# Direct-key (not embedding-search) slot in the same per-domain namespace SiteMemory
+# facts use — a crawled site map is structured data, not a prose fact worth embedding.
+SITE_MAP_KEY = "site_map"
+SITE_MAP_TTL_HOURS = int(os.getenv("SITE_MAP_TTL_HOURS", "24"))
 
 
 def domain_of(target_url: str) -> str:
@@ -61,10 +68,55 @@ def get_memory_manager():
         instructions=(
             "Extract at most a few distilled, reusable facts about this site from the QA "
             "run transcript below — only failure patterns and structural/behavioral quirks "
-            "worth remembering for future test planning. Skip anything not worth persisting."
+            "worth remembering for future test planning. Skip anything not worth persisting. "
+            "Pay special attention to quirks about account creation or login flows (e.g. "
+            "'requires email verification before first login', 'passwords must be at least "
+            "8 characters') surfaced by edge-case or negative test cases below — these are "
+            "exactly what a future planning run needs before it writes its own inline "
+            "signup/login prerequisite steps."
         ),
         enable_inserts=True,
     )
+
+
+async def get_cached_site_map(store: BaseStore | None, target_url: str) -> SiteMap | None:
+    """Direct-key lookup of a previously crawled SiteMap for this domain, or None if
+    absent/stale. Not the semantic/embedding search used for SiteMemory facts — a crawled
+    site map is structured data, not a prose fact worth embedding.
+    """
+    if store is None:
+        return None
+    domain = domain_of(target_url)
+    item = await store.aget((MEMORY_NAMESPACE, domain), SITE_MAP_KEY)
+    if item is None:
+        return None
+    site_map = SiteMap(**item.value)
+    if site_map.crawled_at is None:
+        return None
+    age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(site_map.crawled_at)).total_seconds() / 3600
+    return site_map if age_hours < SITE_MAP_TTL_HOURS else None
+
+
+async def save_site_map(store: BaseStore | None, target_url: str, site_map: SiteMap) -> None:
+    if store is None:
+        return
+    domain = domain_of(target_url)
+    stamped = site_map.model_copy(update={"crawled_at": datetime.now(timezone.utc).isoformat()})
+    # TODO(verify): make_store()'s embedding index is configured with fields=["summary"]
+    # (SiteMemory's field) — SiteMap.model_dump() has no "summary" key. Confirm
+    # AsyncPostgresStore.aput no-ops the indexer gracefully for a value lacking the
+    # configured field rather than erroring.
+    await store.aput((MEMORY_NAMESPACE, domain), SITE_MAP_KEY, stamped.model_dump())
+
+
+async def retrieve_memory_context(target_url: str, query: str, store: BaseStore | None) -> str:
+    """Shared by the one-shot planner and the discovery chat — both want prior
+    cross-run learnings about the target site before drafting/revising a plan."""
+    if store is None:
+        return "No prior learnings recorded for this site yet.\n"
+    domain = domain_of(target_url)
+    items = await store.asearch((MEMORY_NAMESPACE, domain), query=query, limit=5)
+    return format_memories_for_prompt(items)
 
 
 def format_memories_for_prompt(items) -> str:

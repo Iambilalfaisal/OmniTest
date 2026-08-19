@@ -7,6 +7,7 @@ the same tab.
 """
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AsyncExitStack
 
@@ -22,9 +23,15 @@ PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
 # for nodes/worker.py's evidence capture; it also exposes a few extra low-risk tools
 # (browser_annotate, browser_highlight, browser_resume, video-chapter tools) to the
 # worker LLM's tool-calling set as a side effect, since we bind everything indiscriminately.
+# --headless is required, not optional, for our product: @playwright/mcp launches a real,
+# visible browser window on the host desktop by default ("headed") — every automated
+# session (planner crawl, each worker, each discovery-chat dive) would otherwise pop its
+# own Chromium window in front of whatever the person running this is doing. Evidence
+# capture (screenshot/trace/video, evidence.py) works identically headless — nothing is
+# lost by hiding it.
 # See https://playwright.dev/docs/getting-started-mcp and https://github.com/microsoft/playwright-mcp.
 PLAYWRIGHT_MCP_ARGS = os.getenv(
-    "PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated --caps=devtools"
+    "PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated --headless --caps=devtools"
 ).split()
 
 
@@ -65,3 +72,70 @@ async def get_accessibility_snapshot(tools: list, url: str) -> dict:
     tool_map = {tool.name: tool for tool in tools}
     await tool_map["browser_navigate"].ainvoke({"url": url})
     return await tool_map["browser_snapshot"].ainvoke({})
+
+
+def _coerce_text(result) -> str:
+    """MCP tool results surface through langchain_mcp_adapters, whose exact wire shape
+    isn't nailed down anywhere else in this codebase either — get_accessibility_snapshot
+    above is already annotated `-> dict` while being fed straight into a prompt's
+    `.format()` call. Treat this the same way core/memory.py's own TODO(verify) treats an
+    analogous uncertainty: this assumes `.ainvoke()` returns (or stringifies cleanly to)
+    plain text; confirm against the installed langchain-mcp-adapters version if a crawl
+    digest reads oddly in practice.
+    """
+    return result if isinstance(result, str) else str(result)
+
+
+def _coerce_json_array(result) -> list[dict]:
+    try:
+        parsed = json.loads(_coerce_text(result))
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+async def navigate(tools: list, url: str) -> None:
+    """Navigate without snapshotting — reused by planner_explore.crawl_site's page visits."""
+    tool_map = {tool.name: tool for tool in tools}
+    await tool_map["browser_navigate"].ainvoke({"url": url})
+
+
+async def shallow_snapshot(tools: list, *, depth: int) -> str:
+    """Depth-limited accessibility snapshot of the CURRENT page — used for a crawl's
+    per-page digest instead of a full tree, which would blow up the planning prompt
+    across several pages. `browser_snapshot`'s `depth` param limits the snapshot tree's
+    depth (confirmed against the installed @playwright/mcp); planner_explore.py
+    additionally hard-truncates the result by character count regardless, as a backstop.
+    """
+    tool_map = {tool.name: tool for tool in tools}
+    result = await tool_map["browser_snapshot"].ainvoke({"depth": depth})
+    return _coerce_text(result)
+
+
+async def get_page_title(tools: list) -> str:
+    tool_map = {tool.name: tool for tool in tools}
+    result = await tool_map["browser_evaluate"].ainvoke({"function": "() => document.title"})
+    return _coerce_text(result).strip()
+
+
+async def list_page_links(tools: list) -> list[dict]:
+    """Read-only DOM query enumerating <a href> elements on the CURRENT page as
+    [{"text": ..., "href": <absolute URL>}, ...]. Deliberately NOT derived from the
+    accessibility-tree snapshot, which omits link hrefs entirely (only role/name/ref) —
+    link discovery needs the actual URL to follow.
+
+    Uses browser_evaluate with a FIXED, hardcoded, side-effect-free DOM read (never
+    LLM-authored) — this is the only script ever passed to browser_evaluate anywhere in
+    this codebase, so despite that tool's generic "can run arbitrary JS" classification,
+    this specific call has no mutation risk.
+    """
+    tool_map = {tool.name: tool for tool in tools}
+    result = await tool_map["browser_evaluate"].ainvoke(
+        {
+            "function": (
+                "() => Array.from(document.querySelectorAll('a[href]'))"
+                ".map(a => ({text: (a.innerText || a.textContent || '').trim().slice(0, 80), href: a.href}))"
+            )
+        }
+    )
+    return _coerce_json_array(result)

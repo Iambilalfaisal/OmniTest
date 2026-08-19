@@ -39,6 +39,19 @@ def route_to_workers(state: QAState):
     ]
 
 
+def route_entry(state: QAState):
+    """Chat-approved runs (backend/api.py's POST /discover/{id}/message approve handler)
+    arrive with test_cases/plan_approved already set by the discovery conversation —
+    skip planner_node's LLM call and plan_review_node's interrupt (already approved
+    conversationally) straight to the worker fan-out. Runs started the old way
+    (POST /runs, or any future programmatic caller) arrive with plan_approved=False and
+    take the original planner_node -> plan_review_node path, unchanged.
+    """
+    if state.get("plan_approved") and state.get("test_cases"):
+        return route_to_workers(state)
+    return "planner_node"
+
+
 def build_graph(checkpointer, store=None):
     graph = StateGraph(QAState)
 
@@ -48,7 +61,7 @@ def build_graph(checkpointer, store=None):
     graph.add_node("reporter_node", reporter_node)
     graph.add_node("memory_node", memory_node)
 
-    graph.add_edge(START, "planner_node")
+    graph.add_conditional_edges(START, route_entry, ["planner_node", "worker_node", "reporter_node"])
     graph.add_edge("planner_node", "plan_review_node")
     graph.add_conditional_edges("plan_review_node", route_to_workers, ["worker_node", "reporter_node"])
     graph.add_edge("worker_node", "reporter_node")

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import SidebarNav from "@/components/SidebarNav";
 
 export const metadata: Metadata = {
   title: "OmniTest",
@@ -11,34 +12,46 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className="min-h-screen bg-slate-950 text-slate-100 antialiased">
-        <div className="mx-auto max-w-7xl px-4 pb-10 pt-6 md:px-6 lg:px-8">
-          <header className="mb-8 rounded-3xl border border-white/10 bg-slate-900/80 px-5 py-4 shadow-2xl shadow-slate-950/40 backdrop-blur-xl">
-            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-500 to-violet-500 text-base font-bold text-white shadow-lg shadow-cyan-500/20">
+        <div className="flex min-h-screen">
+          <aside className="glass-panel sticky top-0 hidden h-screen w-64 shrink-0 rounded-none border-b-0 border-l-0 border-t-0 md:flex md:flex-col">
+            <SidebarNav />
+          </aside>
+
+          <div className="flex min-h-screen flex-1 flex-col">
+            {/* Mobile top bar — the sidebar takes over from md: up */}
+            <header className="glass-panel m-4 flex items-center justify-between rounded-3xl px-4 py-3 md:hidden">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-violet-500 text-sm font-bold text-white">
                   O
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.28em] text-cyan-300/80">AI QA</div>
-                  <div className="text-lg font-semibold text-white">OmniTest</div>
-                </div>
+                <span className="text-sm font-semibold text-white">OmniTest</span>
               </div>
-
-              <nav className="flex items-center gap-2 text-sm">
-                <Link href="/" className="rounded-full border border-white/10 bg-slate-950/50 px-4 py-2 text-slate-200 transition hover:border-cyan-500/30 hover:text-white">
+              <nav className="flex items-center gap-1 text-xs">
+                <Link href="/" className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-slate-200">
                   Home
                 </Link>
-                <Link href="/run" className="rounded-full border border-white/10 bg-slate-950/50 px-4 py-2 text-slate-200 transition hover:border-cyan-500/30 hover:text-white">
-                  Live run
+                <Link href="/history" className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-slate-200">
+                  History
                 </Link>
-                <Link href="/reports" className="rounded-full border border-white/10 bg-slate-950/50 px-4 py-2 text-slate-200 transition hover:border-cyan-500/30 hover:text-white">
+                <Link href="/reports" className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-slate-200">
                   Reports
                 </Link>
               </nav>
-            </div>
-          </header>
+            </header>
 
-          <main>{children}</main>
+            <div className="hidden justify-end px-4 pt-6 md:flex md:px-6 lg:px-8">
+              <Link
+                href="/"
+                className="rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110"
+              >
+                + New session
+              </Link>
+            </div>
+
+            <div className="flex-1 px-4 pb-10 pt-4 md:px-6 md:pt-2 lg:px-8">
+              <main>{children}</main>
+            </div>
+          </div>
         </div>
       </body>
     </html>

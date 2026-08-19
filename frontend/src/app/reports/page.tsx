@@ -2,6 +2,7 @@
 
 import { FormEvent, useState } from "react";
 import TraceViewer from "@/components/TraceViewer";
+import { CATEGORY_LABELS, CATEGORY_STYLES, TestCategory } from "@/components/WorkerCard";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -15,7 +16,12 @@ type TestResult = {
 };
 
 type RunReport = {
-  summary: { total: number; passed: number; failed: number };
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    by_category?: Record<TestCategory, { total: number; passed: number; failed: number }>;
+  };
   test_results: TestResult[];
   plan_approved: boolean;
 };
@@ -83,6 +89,29 @@ export default function ReportsPage() {
               <div className="mt-3 text-3xl font-semibold text-rose-300">{report.summary.failed}</div>
             </div>
           </section>
+
+          {report.summary.by_category && Object.keys(report.summary.by_category).length > 0 && (
+            <section className="glass-panel rounded-3xl p-5 md:p-6">
+              <h2 className="mb-4 text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">By category</h2>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                {Object.entries(report.summary.by_category).map(([category, counts]) => (
+                  <div key={category} className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.15em] ${
+                        CATEGORY_STYLES[category as TestCategory] ?? ""
+                      }`}
+                    >
+                      {CATEGORY_LABELS[category as TestCategory] ?? category}
+                    </span>
+                    <div className="mt-2 text-sm text-slate-300">
+                      {counts.passed}/{counts.total} passed
+                      {counts.failed > 0 && <span className="text-rose-300"> · {counts.failed} failed</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           <section className="glass-panel rounded-3xl p-5 md:p-6">
             <div className="mb-5 flex items-center justify-between">
