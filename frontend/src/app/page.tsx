@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
+import OrbitMark from "@/components/OrbitMark";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -42,45 +43,50 @@ export default function HomePage() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 py-8">
-      <section className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-        <div className="glass-panel rounded-3xl p-8 md:p-10">
+    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-8 py-8">
+      <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-[32rem] opacity-70" />
+      <section className="relative grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
+        <div className="glass-panel animate-rise overflow-hidden rounded-[2rem] p-8 md:p-12">
+          <div className="signal-line mb-8 h-px w-40" />
           <div className="mb-6 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-500 to-violet-500 text-lg font-bold text-white shadow-lg shadow-cyan-500/30">
-              O
-            </div>
+            <OrbitMark size="lg" />
             <div>
-              <p className="text-xs uppercase tracking-[0.28em] text-cyan-300/80">AI QA platform</p>
-              <h1 className="text-3xl font-semibold tracking-tight text-white md:text-4xl">OmniTest</h1>
+              <p className="eyebrow">Autonomous quality intelligence</p>
+              <h1 className="mt-2 text-4xl font-semibold tracking-[-0.03em] text-white md:text-6xl">OmniTest</h1>
             </div>
           </div>
 
-          <p className="max-w-xl text-base leading-7 text-slate-300 md:text-lg">
+          <p className="max-w-2xl text-base leading-7 text-slate-300 md:text-xl md:leading-8">
             Give a URL and OmniTest explores the site, proposes a test plan grouped by feature — happy
             paths, edge cases, and negative cases — and talks it through with you before anything runs.
           </p>
 
+          <div className="mt-8 flex items-center gap-3 text-xs uppercase tracking-[0.2em] text-slate-500">
+            <span className="h-2 w-2 rounded-full bg-lime-300 shadow-[0_0_14px_#c5f36a]" />
+            Exploration engine ready
+          </div>
+
           <div className="mt-8 grid gap-4 sm:grid-cols-3">
             {[
-              { label: "Live runs", value: "24/7" },
-              { label: "Browser coverage", value: "MCP" },
-              { label: "Evidence", value: "Trace + video" },
+              { label: "Live runs", value: "24/7", tone: "text-cyan-300" },
+              { label: "Browser coverage", value: "MCP", tone: "text-violet-300" },
+              { label: "Evidence", value: "Trace + video", tone: "text-lime-300" },
             ].map((item) => (
-              <div key={item.label} className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-                <div className="text-xl font-semibold text-white">{item.value}</div>
+              <div key={item.label} className="rounded-2xl border border-white/10 bg-black/10 p-4 transition hover:-translate-y-1 hover:border-white/20">
+                <div className={`text-xl font-semibold ${item.tone}`}>{item.value}</div>
                 <div className="mt-1 text-xs uppercase tracking-[0.2em] text-slate-400">{item.label}</div>
               </div>
             ))}
           </div>
         </div>
 
-        <div className="glass-panel rounded-3xl p-6 md:p-8">
+        <div className="glass-panel animate-rise-delay rounded-[2rem] p-6 md:p-8">
           <div className="mb-5 flex items-center justify-between">
             <div>
-              <p className="text-xs uppercase tracking-[0.25em] text-slate-400">New session</p>
+              <p className="eyebrow">Initialize / 00</p>
               <h2 className="mt-2 text-2xl font-semibold text-white">Explore &amp; plan</h2>
             </div>
-            <div className="rounded-full border border-cyan-400/40 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300">
+            <div className="rounded-full border border-lime-300/30 bg-lime-300/10 px-3 py-1 text-xs font-medium text-lime-200">
               Ready
             </div>
           </div>

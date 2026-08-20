@@ -4,6 +4,12 @@
 
 :root {
   color-scheme: dark;
+  --ink: #07111f;
+  --panel: rgba(9, 23, 40, 0.78);
+  --line: rgba(148, 163, 184, 0.16);
+  --cyan: #39e7d3;
+  --violet: #8b7cff;
+  --lime: #c5f36a;
 }
 
 html {
@@ -12,10 +18,11 @@ html {
 
 body {
   background:
-    radial-gradient(circle at top left, rgba(34, 211, 238, 0.2), transparent 24%),
-    radial-gradient(circle at top right, rgba(168, 85, 247, 0.18), transparent 28%),
-    linear-gradient(180deg, #020617 0%, #020817 100%);
+    radial-gradient(circle at 12% 0%, rgba(57, 231, 211, 0.13), transparent 25%),
+    radial-gradient(circle at 88% 12%, rgba(139, 124, 255, 0.16), transparent 26%),
+    linear-gradient(135deg, #06101e 0%, #091626 45%, #07101c 100%);
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 @layer base {
@@ -24,7 +31,8 @@ body {
   }
 
   body {
-    @apply m-0 font-sans text-slate-100;
+    @apply m-0 text-slate-100;
+    font-family: "Avenir Next", "Segoe UI", sans-serif;
   }
 
   a {
@@ -34,6 +42,88 @@ body {
 
 @layer components {
   .glass-panel {
-    @apply border border-white/10 bg-slate-900/70 shadow-2xl shadow-slate-950/40 backdrop-blur-xl;
+    @apply border backdrop-blur-xl;
+    background: var(--panel);
+    border-color: var(--line);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  }
+
+  .eyebrow {
+    @apply text-[10px] font-semibold uppercase tracking-[0.3em];
+    color: var(--cyan);
+  }
+
+  .page-grid {
+    background-image: linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+    background-size: 38px 38px;
+    mask-image: linear-gradient(to bottom, black, transparent 72%);
+  }
+
+  .signal-line {
+    background: linear-gradient(90deg, transparent, var(--cyan), var(--violet), transparent);
+    box-shadow: 0 0 18px rgba(57, 231, 211, 0.55);
+  }
+
+  .orbit-mark {
+    position: relative;
+    flex: none;
+    perspective: 500px;
+    transform: rotateX(58deg) rotateZ(-24deg);
+  }
+
+  .orbit-mark__core {
+    position: absolute;
+    inset: 34%;
+    border-radius: 999px;
+    background: var(--lime);
+    box-shadow: 0 0 20px rgba(197, 243, 106, 0.9);
+  }
+
+  .orbit-mark__ring {
+    position: absolute;
+    inset: 8%;
+    border: 1px solid rgba(57, 231, 211, 0.75);
+    border-radius: 999px;
+    transform: rotateY(62deg);
+  }
+
+  .orbit-mark__ring--two {
+    inset: 18%;
+    border-color: rgba(139, 124, 255, 0.8);
+    transform: rotateY(-62deg) rotateX(20deg);
+  }
+
+  .orbit-mark__satellite {
+    position: absolute;
+    top: 4%;
+    right: 7%;
+    height: 8px;
+    width: 8px;
+    border-radius: 999px;
+    background: var(--cyan);
+    box-shadow: 0 0 12px var(--cyan);
+    animation: orbit-pulse 2.8s ease-in-out infinite;
+  }
+
+  .animate-rise { animation: rise-in 700ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+  .animate-rise-delay { animation: rise-in 700ms 130ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+  @keyframes rise-in {
+    from { opacity: 0; transform: translateY(14px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes orbit-pulse {
+    0%, 100% { transform: scale(0.8); opacity: 0.7; }
+    50% { transform: scale(1.35); opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+    }
   }
 }

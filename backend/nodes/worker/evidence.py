@@ -11,6 +11,13 @@ from pathlib import Path
 
 EVIDENCE_DIR = Path(__file__).resolve().parent.parent.parent / "evidence"
 
+# Session keys for which browser_video_show_actions has already been turned on —
+# tracked here (not in session.py's _SESSIONS tuple) so enabling it stays a small,
+# self-contained add-on instead of changing that tuple's shape everywhere it's
+# unpacked. See ensure_action_overlay() for why this can't just happen once in
+# start_capture().
+_action_overlay_enabled: set[str] = set()
+
 
 def run_dir_for(session_key: str) -> Path:
     # session_key contains ":" (invalid in a Windows path component) — sanitize for the dir name.
@@ -37,6 +44,39 @@ async def start_capture(tool_map: dict, session_key: str) -> None:
         run_dir = run_dir_for(session_key)
         run_dir.mkdir(parents=True, exist_ok=True)
         await tool_map["browser_start_video"].ainvoke({"filename": str(run_dir / "video.webm")})
+
+
+async def ensure_action_overlay(tool_map: dict, session_key: str) -> None:
+    """Best-effort, idempotent: turns on @playwright/mcp's built-in
+    browser_video_show_actions (--caps=devtools) the first time it can succeed for this
+    session, then never calls it again. It bakes a callout naming each subsequent
+    action, a highlight box around the action's target element, and an animated
+    pointer moving between action points directly into the recorded video — so a human
+    watching the recording afterward can see exactly what the agent clicked or typed
+    on, not just the end result.
+
+    Can't just be called once from start_capture() alongside browser_start_video:
+    unlike video/tracing start (context-level, no page needed), this tool operates on
+    "the current tab" and throws ("No open pages available.") until the session's
+    first page exists — which happens lazily, on the first navigate/click/etc., not at
+    session-open time. So this is called again after every real tool_node action;
+    it's a no-op past the first success (tracked in _action_overlay_enabled), and
+    harmlessly retries on failure (no tab yet) until one exists.
+    """
+    if session_key in _action_overlay_enabled:
+        return
+    tool = tool_map.get("browser_video_show_actions")
+    if tool is None:
+        return
+    try:
+        await tool.ainvoke({})
+        _action_overlay_enabled.add(session_key)
+    except Exception:
+        pass  # no open tab yet — the next action's attempt will retry
+
+
+def discard_action_overlay(session_key: str) -> None:
+    _action_overlay_enabled.discard(session_key)
 
 
 async def capture_screenshot(tool_map: dict, run_dir: Path) -> str:

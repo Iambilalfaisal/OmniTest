@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
 import SidebarNav from "@/components/SidebarNav";
+import OrbitMark from "@/components/OrbitMark";
 
 export const metadata: Metadata = {
   title: "OmniTest",
@@ -11,19 +12,17 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-slate-950 text-slate-100 antialiased">
+      <body className="min-h-screen text-slate-100 antialiased">
         <div className="flex min-h-screen">
-          <aside className="glass-panel sticky top-0 hidden h-screen w-64 shrink-0 rounded-none border-b-0 border-l-0 border-t-0 md:flex md:flex-col">
+          <aside className="glass-panel sticky top-0 hidden h-screen w-72 shrink-0 rounded-none border-b-0 border-l-0 border-t-0 md:flex md:flex-col">
             <SidebarNav />
           </aside>
 
           <div className="flex min-h-screen flex-1 flex-col">
             {/* Mobile top bar — the sidebar takes over from md: up */}
-            <header className="glass-panel m-4 flex items-center justify-between rounded-3xl px-4 py-3 md:hidden">
+            <header className="glass-panel m-3 flex items-center justify-between rounded-2xl px-4 py-3 md:hidden">
               <div className="flex items-center gap-2">
-                <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-violet-500 text-sm font-bold text-white">
-                  O
-                </div>
+                <OrbitMark size="sm" />
                 <span className="text-sm font-semibold text-white">OmniTest</span>
               </div>
               <nav className="flex items-center gap-1 text-xs">
@@ -39,10 +38,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               </nav>
             </header>
 
-            <div className="hidden justify-end px-4 pt-6 md:flex md:px-6 lg:px-8">
+            <div className="hidden items-center justify-between px-6 pt-6 md:flex lg:px-8">
+              <div className="flex items-center gap-2 text-xs text-slate-500"><span className="h-1.5 w-1.5 rounded-full bg-lime-300 shadow-[0_0_10px_#c5f36a]" />System nominal</div>
               <Link
                 href="/"
-                className="rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110"
+                className="rounded-xl border border-cyan-300/30 bg-cyan-300/10 px-4 py-2 text-xs font-semibold text-cyan-100 shadow-lg shadow-cyan-500/10 transition hover:bg-cyan-300/20"
               >
                 + New session
               </Link>

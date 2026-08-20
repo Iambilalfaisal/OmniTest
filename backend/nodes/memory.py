@@ -27,8 +27,16 @@ async def memory_node(state: QAState, *, store: BaseStore | None = None) -> dict
             result = results_by_id.get(test_case.test_id)
             if result is None:
                 continue
+            # expected_result is included so the extractor can tell an actual site
+            # constraint ("expected a rejection, got one, with this wording") from a test
+            # case that simply expected the wrong thing — without it, a Fail reason alone
+            # reads the same either way and gets persisted as a bogus "site quirk". getattr,
+            # not direct access: this best-effort node must never raise on a test_case from
+            # a checkpoint predating ensure_expected_result (core/run_planning.py).
             transcript_lines.append(
-                f"Goal: {test_case.goal}\nCategory: {test_case.category}\nStatus: {result.status}\nReason: {result.reason}\n"
+                f"Goal: {test_case.goal}\nCategory: {test_case.category}\n"
+                f"Expected: {getattr(test_case, 'expected_result', None) or '(not specified)'}\n"
+                f"Status: {result.status}\nReason: {result.reason}\n"
             )
         transcript = "\n".join(transcript_lines)
 

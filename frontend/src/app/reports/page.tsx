@@ -52,8 +52,9 @@ export default function ReportsPage() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 py-4">
-      <div className="glass-panel rounded-3xl p-6">
+    <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-6 py-4">
+      <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-96 opacity-60" />
+      <div className="glass-panel animate-rise relative rounded-[2rem] p-6">
         <form onSubmit={loadReport} className="flex flex-col gap-4 md:flex-row">
           <input
             value={runId}

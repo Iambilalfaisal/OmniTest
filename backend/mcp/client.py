@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -19,10 +20,6 @@ PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
 # PERSISTENT shared browser profile, but we spin up one subprocess per parallel worker —
 # without --isolated, concurrent workers would fight over the same profile directory
 # instead of getting independent browsers.
-# --caps=devtools opts into browser_start_tracing/browser_start_video (+ stop_ variants)
-# for nodes/worker.py's evidence capture; it also exposes a few extra low-risk tools
-# (browser_annotate, browser_highlight, browser_resume, video-chapter tools) to the
-# worker LLM's tool-calling set as a side effect, since we bind everything indiscriminately.
 # --headless is required, not optional, for our product: @playwright/mcp launches a real,
 # visible browser window on the host desktop by default ("headed") — every automated
 # session (planner crawl, each worker, each discovery-chat dive) would otherwise pop its
@@ -30,9 +27,28 @@ PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
 # capture (screenshot/trace/video, evidence.py) works identically headless — nothing is
 # lost by hiding it.
 # See https://playwright.dev/docs/getting-started-mcp and https://github.com/microsoft/playwright-mcp.
-PLAYWRIGHT_MCP_ARGS = os.getenv(
-    "PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated --headless --caps=devtools"
-).split()
+PLAYWRIGHT_MCP_ARGS = os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest --isolated --headless").split()
+
+# devtools opts into browser_start_tracing/browser_start_video (+ stop_ variants) for
+# nodes/worker.py's evidence capture, plus a few extra low-risk tools (browser_annotate,
+# browser_highlight, video-chapter tools) as a side effect, since we bind everything
+# indiscriminately. storage opts into browser_storage_state/browser_set_storage_state,
+# used by nodes/auth_setup.py (Stage 3) to capture one shared login once and restore it
+# into each requires_auth TestCase's own isolated browser, instead of every such case
+# paying its own ~15-turn signup/login tax.
+#
+# CONFIRMED live against the installed @playwright/mcp (0.0.79): passing MULTIPLE
+# capabilities via `--caps=devtools,storage` (or two repeated `--caps` flags) silently
+# yields NEITHER — comma-joined values aren't split, and repeated flags overwrite rather
+# than accumulate. Verified directly, tool-by-tool: `--caps=storage` alone correctly
+# exposes all 17 storage/cookie tools; `--caps=devtools` alone correctly exposes all 7
+# tracing/video tools; `--caps=devtools,storage` together exposes ZERO of either, falling
+# silently back to the 24-tool default — this is exactly what made every requires_auth
+# TestCase run unauthenticated and every trace/video capture silently no-op. The `--config
+# <path>` JSON form does NOT share this bug (confirmed the same way): its `capabilities`
+# array combines correctly, so that's what's used here instead of `--caps=...`.
+_CONFIG_PATH = Path(__file__).resolve().parent / "playwright-mcp-config.json"
+PLAYWRIGHT_MCP_ARGS = [*PLAYWRIGHT_MCP_ARGS, f"--config={_CONFIG_PATH}"]
 
 
 def create_playwright_client() -> MultiServerMCPClient:

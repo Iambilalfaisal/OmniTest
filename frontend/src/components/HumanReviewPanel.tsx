@@ -144,6 +144,12 @@ function PlanReviewCard({
                   </span>
                 )}
               </div>
+              {tc.expected_result && (
+                <p className="mt-1 text-xs text-slate-400">
+                  <span className="font-semibold text-slate-300">Expected: </span>
+                  {tc.expected_result}
+                </p>
+              )}
               <ol className="mt-2 space-y-1 text-xs text-slate-400">
                 {tc.steps.map((step, i) => (
                   <li key={i}>

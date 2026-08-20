@@ -29,6 +29,17 @@ def _keep_latest(_current: str, new: str) -> str:
     return new
 
 
+def _keep_latest_auth_state(_current: str | None, new: str | None) -> str | None:
+    """Same rationale as `_keep_latest` above, generalized for `auth_storage_state`
+    (Stage 3): `auth_setup_node` sets this ONCE, before the fan-out to `worker_node`, and
+    every parallel branch then carries that same (unmodified) value through to its own
+    final state. Without a reducer here, N branches "writing" it back in the same
+    superstep hits the identical `InvalidUpdateError` `_keep_latest` exists to avoid —
+    which value wins is irrelevant since every branch's copy is identical.
+    """
+    return new
+
+
 class QAState(TypedDict):
     target_url: Annotated[str, _keep_latest]
     instruction: str
@@ -40,6 +51,15 @@ class QAState(TypedDict):
     test_results: Annotated[list[TestResult], operator.add]
     summary: dict
     plan_approved: bool
+    # Stage 3 — set once by auth_setup_node (nodes/auth_setup.py) before the worker
+    # fan-out, from a single shared login/signup; None if no test_case in this run has
+    # requires_auth=True, or if establishing it failed. Holds the ABSOLUTE PATH to the
+    # storage-state file auth_setup_node had browser_storage_state write to (confirmed
+    # against the installed @playwright/mcp: both browser_storage_state and
+    # browser_set_storage_state are file-based, taking a `filename` param, not an inline
+    # blob) — agent_node passes this same path straight back as browser_set_storage_state's
+    # `filename`. Still just a plain, JSON-checkpointable string.
+    auth_storage_state: Annotated[str | None, _keep_latest_auth_state]
 
 
 class WorkerState(TypedDict):
@@ -59,3 +79,7 @@ class WorkerState(TypedDict):
     test_results: list[TestResult]
     sensitive_answers: list[str]  # ask_human answers marked sensitive — redacted out of
                                    # the final verdict reason before it leaves this subgraph.
+    # Stage 3 — populated in the Send() payload (graph/builder.py's route_to_workers)
+    # only when test_case.requires_auth is True; None otherwise. No reducer needed here:
+    # unlike QAState's copy, nothing inside this subgraph ever rewrites it.
+    auth_storage_state: str | None

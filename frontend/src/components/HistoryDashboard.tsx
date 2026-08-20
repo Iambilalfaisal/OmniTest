@@ -178,9 +178,10 @@ export default function HistoryDashboard() {
   const trendDays = stats ? fillDailyTrend(stats.trend, since, until) : [];
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 py-4">
-      <header className="glass-panel rounded-3xl p-6">
-        <p className="text-xs uppercase tracking-[0.3em] text-cyan-300/80">History</p>
+    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-5 py-4">
+      <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-96 opacity-60" />
+      <header className="glass-panel animate-rise relative rounded-[2rem] p-6">
+        <p className="eyebrow">History / Observatory</p>
         <h1 className="mt-2 text-2xl font-semibold text-white">All sessions</h1>
       </header>
 

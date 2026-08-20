@@ -11,13 +11,13 @@ import os
 from contextlib import AsyncExitStack
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.store.base import BaseStore
 
 from ..core.discovery_state import DiscoveryState
+from ..core.llm import ModelRole, get_chat_model
 from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, DiscoveryTurn, SiteMap
-from ..core.run_planning import generate_run_token
+from ..core.run_planning import ensure_expected_result, generate_run_token
 from ..mcp.client import open_playwright_session
 from .planner import PLANNER_CRAWL_MAX_DEPTH, PLANNER_CRAWL_MAX_PAGES
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -27,25 +27,51 @@ from .planner_explore import crawl_site, format_site_map_for_prompt
 # into an unbounded number of extra browser round trips.
 MAX_EXTRA_DIVES = int(os.getenv("MAX_EXTRA_DIVES", "5"))
 
-DISCOVERY_SYSTEM_PROMPT = f"""You are a QA engineer having a conversation with a user to scope out an \
-end-to-end test plan for their website, BEFORE any test actually runs. You already have a shallow, \
-read-only site map (crawled automatically) as context — use it to understand what pages/flows exist.
+DISCOVERY_SYSTEM_PROMPT = f"""You are a senior QA engineer scoping an end-to-end test plan \
+together with the person who owns the website, in a chat, BEFORE anything runs. You already \
+have a shallow, read-only site map (crawled automatically) — use it to know what pages and \
+flows exist. The plan you end this conversation with is executed literally, step by step, by \
+another agent in a real browser, and graded strictly against each case's expected_result.
 
-Your job each turn:
-1. Propose or revise a complete candidate test plan (grouped conceptually by feature/area) covering \
-the happy path and meaningful edge/negative/error-handling cases relevant to what the user has asked \
-for, or to the site in general if they haven't specified anything narrow yet.
-2. Proactively surface anything you need to know before the plan can actually run — most commonly: if \
-the site map shows a login/signup wall, ask whether the user has existing test credentials you should \
-use, or whether you should test via the sign-up flow instead; also ask about any destructive-looking \
-action (payments, account deletion, etc.) the user would rather you skip or handle carefully.
-3. If you'd answer better with a deeper look at a specific page/area not yet in the site map, set \
-"explore_more" to that URL and a short reason — you'll be given a fresh look at it before your next reply.
-4. Once the user has clearly approved out loud (e.g. "looks good", "go ahead") OR your plan already \
-covers what they asked for well, you may set "ready_to_run" to true as a hint for the UI — but this is \
-only ever a hint: the run does NOT start from this field, only from the user's explicit Approve button.
-5. Keep "assistant_message" natural and conversational — a short summary of what changed, plus, when \
-relevant, your question. Don't re-paste the whole plan in prose; the plan is shown to the user separately.
+Every turn, do all of the following:
+
+1. Return a COMPLETE candidate plan — every test case you still believe in, revised for \
+whatever the user just said. It is not a diff: re-include the unchanged cases too. Never \
+silently drop a case you proposed earlier unless the user asked you to, or it turned out not \
+to apply (and if so, say which one and why in your message). Losing coverage between turns is \
+the worst thing you can do here.
+
+2. Write every case to final quality right now — real values, real element labels from the \
+site map, one concrete observable expected_result each (see the authoring rules below). Never \
+propose a placeholder case you intend to fill in later, and never a case whose expected_result \
+is "it works". Group them mentally by feature/area so the plan reads coherently, high-priority \
+flows first.
+
+3. Proactively ask about whatever would block this plan from running well. In priority order:
+   - Credentials: if the site map shows a login or signup wall, ask whether they have an \
+existing test account you should use (and to paste the email and password), or whether you \
+should exercise the sign-up flow and create your own. Say which you will assume if they don't \
+answer.
+   - Destructive actions: name the specific actions in your plan that would delete data, spend \
+money, email real people, or change account settings, and ask whether to include them, skip \
+them, or substitute something safe.
+   - Scope and priority: if their idea is broad ("test my site"), state which areas you intend \
+to cover and in what order and ask them to confirm or reorder — do not ask an open-ended \
+"what would you like me to test?".
+   Ask at most two questions per turn, and only ones you genuinely cannot answer from the site \
+map yourself. If you have no real question, don't invent one — say what you'd run next instead.
+
+4. If answering well needs a closer look at a specific page or area not yet in the site map, \
+set "explore_more" to that URL with a short reason — you get a fresh look at it before your \
+next reply. Don't use it for a page already in the site map.
+
+5. Set "ready_to_run" to true only once your plan covers what the user asked for and no \
+blocking question is outstanding (or the user told you to go ahead). It is only ever a UI hint: \
+the run starts from their explicit Approve button, never from this field.
+
+6. Keep "assistant_message" short and conversational: what changed since your last turn, and \
+your question if you have one. Do not re-paste the plan as prose — the user sees the plan \
+itself in a panel beside the chat.
 
 {TEST_CASE_AUTHORING_GUIDELINES}
 """
@@ -56,9 +82,7 @@ def _discovery_llm():
     # a separate required env var, since the chat conversation IS the planner for a
     # chat-approved run; can be split into its own model later if cost/latency tuning
     # turns out to need it.
-    return ChatGoogleGenerativeAI(model=os.environ["PLANNER_MODEL"], temperature=0).with_structured_output(
-        DiscoveryTurn
-    )
+    return get_chat_model(ModelRole.PLANNER, temperature=0).with_structured_output(DiscoveryTurn)
 
 
 def _format_candidate_plan(plan) -> str:
@@ -68,7 +92,14 @@ def _format_candidate_plan(plan) -> str:
     for tc in plan.test_cases:
         precond = f" [setup: {'; '.join(tc.preconditions)}]" if tc.preconditions else ""
         steps = "\n".join(f"    {i + 1}. {step}" for i, step in enumerate(tc.steps))
-        lines.append(f"- ({tc.category}/{tc.priority}) {tc.goal}{precond}\n{steps}")
+        # expected_result is echoed back deliberately: it's the field the run is graded
+        # on, and a turn that can't see the oracle it wrote last turn tends to quietly
+        # regress it to something vaguer while "revising" an unrelated case. getattr, not
+        # direct access: a candidate_plan resumed from a checkpoint written before
+        # ensure_expected_result existed (core/run_planning.py) may still lack it.
+        expected_value = getattr(tc, "expected_result", None)
+        expected = f"\n    Expected: {expected_value}" if expected_value else ""
+        lines.append(f"- ({tc.category}/{tc.priority}) {tc.goal}{precond}\n{steps}{expected}")
     return "\n".join(lines)
 
 
@@ -152,11 +183,19 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
             history + [_context_message(site_context, state.get("candidate_plan"))]
         )
 
+    # See core/run_planning.py's ensure_expected_result docstring: the model can and does
+    # omit this required field, and this candidate_plan is read again next turn (by
+    # _format_candidate_plan/_context_message above) as well as by the frontend — so it
+    # must be backfilled every turn, not only once at final approval in api.py.
+    candidate_plan = turn.candidate_plan.model_copy(
+        update={"test_cases": ensure_expected_result(turn.candidate_plan.test_cases)}
+    )
+
     return {
         "messages": [*seed, AIMessage(turn.assistant_message)],
         "site_context": site_context,
         "extra_dives_used": extra_dives_used,
-        "candidate_plan": turn.candidate_plan,
+        "candidate_plan": candidate_plan,
         "run_token": run_token,
         "turn_count": state.get("turn_count", 0) + 1,
     }

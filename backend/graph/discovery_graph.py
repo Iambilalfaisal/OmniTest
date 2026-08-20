@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy, interrupt
+from langgraph.types import interrupt
 
 from ..core.discovery_state import DiscoveryState
+from ..core.llm import LLM_RETRY_POLICY
 from ..nodes.discovery import discovery_agent_node
 
 
@@ -48,7 +49,7 @@ def route_after_discovery(state: DiscoveryState) -> str:
 def build_discovery_graph(checkpointer, store=None):
     graph = StateGraph(DiscoveryState)
 
-    graph.add_node("discovery_agent_node", discovery_agent_node, retry_policy=RetryPolicy(max_attempts=3))
+    graph.add_node("discovery_agent_node", discovery_agent_node, retry_policy=LLM_RETRY_POLICY)
     # No retry on discovery_wait_node — nothing precedes its interrupt() that's worth
     # retrying, same reasoning as nodes/worker/nodes.py's tool_node.
     graph.add_node("discovery_wait_node", discovery_wait_node)

@@ -16,11 +16,12 @@ from datetime import datetime, timezone
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langgraph.store.base import BaseStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langmem import create_memory_manager
 
+from .llm import ModelRole, get_chat_model
 from .models import SiteMemory, SiteMap
 
 MEMORY_NAMESPACE = "site_memory"
@@ -56,24 +57,33 @@ async def make_store() -> AsyncIterator[AsyncPostgresStore]:
 
 
 def get_memory_manager():
-    # Lazy for the same reason as get_embeddings() above.
+    # get_chat_model (core/llm.py) is itself lazy, for the same reason as
+    # get_embeddings() above.
     # TODO(verify): SiteMemory.related_goal is Optional (str | None) — some
     # langchain-google-genai versions have had quirks with Optional/nullable fields
     # in structured-output/function-calling schemas. Confirm langmem's extraction
     # against this schema actually works with Gemini before relying on it.
-    model = ChatGoogleGenerativeAI(model=os.environ["MEMORY_EXTRACTION_MODEL"], temperature=0)
+    model = get_chat_model(ModelRole.MEMORY, temperature=0)
     return create_memory_manager(
         model,
         schemas=[SiteMemory],
         instructions=(
-            "Extract at most a few distilled, reusable facts about this site from the QA "
-            "run transcript below — only failure patterns and structural/behavioral quirks "
-            "worth remembering for future test planning. Skip anything not worth persisting. "
-            "Pay special attention to quirks about account creation or login flows (e.g. "
-            "'requires email verification before first login', 'passwords must be at least "
-            "8 characters') surfaced by edge-case or negative test cases below — these are "
-            "exactly what a future planning run needs before it writes its own inline "
-            "signup/login prerequisite steps."
+            "Extract at most a few distilled, reusable facts about this site from the QA run "
+            "transcript below — only failure patterns and structural/behavioral quirks worth "
+            "remembering the next time someone plans tests for this same site. Each fact must "
+            "be specific enough to change a future test case: name the flow, the field, and "
+            "the exact message or rule text the run actually observed. Quote real text where "
+            "the transcript has it.\n"
+            "Pay special attention to constraints on account creation and login — password "
+            "rules ('passwords must be at least 8 characters'), verification requirements "
+            "('requires email confirmation before first login'), rate limiting or lockout, "
+            "and the exact wording of rejection messages. These are precisely what a future "
+            "planning run needs before it writes its own inline signup/login steps or decides "
+            "what a negative auth case should expect to see.\n"
+            "Do NOT record: anything you only inferred rather than observed in the transcript; "
+            "generic testing advice; restatements of a test case's own goal; or one-off "
+            "environment noise (a timeout, a flaky load). If nothing meets that bar, extract "
+            "nothing — an empty result is better than a vague fact that misleads the next run."
         ),
         enable_inserts=True,
     )

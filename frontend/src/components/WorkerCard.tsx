@@ -7,6 +7,9 @@ export type TestCase = {
   category: TestCategory;
   priority: TestPriority;
   preconditions: string[];
+  // The oracle the run is graded against (backend/core/models.py). Optional here only so
+  // a plan persisted before the field existed still renders instead of crashing.
+  expected_result?: string;
   steps: string[];
 };
 
@@ -114,6 +117,12 @@ export default function WorkerCard({
           <h3 className="mt-2 text-xl font-semibold text-white">{testCase.goal}</h3>
           {testCase.preconditions?.length > 0 && (
             <p className="mt-1 text-xs italic text-slate-400">Setup: {testCase.preconditions.join("; ")}</p>
+          )}
+          {testCase.expected_result && (
+            <p className="mt-1 text-xs text-slate-400">
+              <span className="font-semibold text-slate-300">Expected: </span>
+              {testCase.expected_result}
+            </p>
           )}
         </div>
         <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] ${STATUS_STYLES[status] ?? STATUS_STYLES.default}`}>

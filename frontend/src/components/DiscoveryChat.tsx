@@ -149,11 +149,12 @@ export default function DiscoveryChat() {
   const canReply = status === "in_progress" && !atTurnLimit;
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 py-4">
-      <header className="glass-panel rounded-3xl p-6 md:p-8">
+    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6 py-4">
+      <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-96 opacity-60" />
+      <header className="glass-panel animate-rise relative rounded-[2rem] p-6 md:p-8">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-cyan-300/80">Discovery session</p>
+            <p className="eyebrow">Discovery session / Live</p>
             <h1 className="mt-2 text-2xl font-semibold text-white">{targetUrl}</h1>
           </div>
           <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
@@ -251,6 +252,12 @@ export default function DiscoveryChat() {
                   <p className="mt-2 text-sm font-medium text-white">{tc.goal}</p>
                   {tc.preconditions?.length > 0 && (
                     <p className="mt-1 text-xs italic text-slate-400">Setup: {tc.preconditions.join("; ")}</p>
+                  )}
+                  {tc.expected_result && (
+                    <p className="mt-1 text-xs text-slate-400">
+                      <span className="font-semibold text-slate-300">Expected: </span>
+                      {tc.expected_result}
+                    </p>
                   )}
                   <ol className="mt-2 space-y-1 text-xs text-slate-400">
                     {tc.steps.map((step, i) => (

@@ -192,11 +192,12 @@ export default function RunPageClient() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 py-4">
-      <header className="glass-panel rounded-3xl p-6 md:p-8">
+    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6 py-4">
+      <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-96 opacity-60" />
+      <header className="glass-panel animate-rise relative rounded-[2rem] p-6 md:p-8">
         <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
-            <p className="text-xs uppercase tracking-[0.3em] text-cyan-300/80">Run session</p>
+            <p className="eyebrow">Run session / Live telemetry</p>
             <h1 className="mt-2 text-3xl font-semibold text-white">{runId.slice(0, 8)}</h1>
           </div>
 

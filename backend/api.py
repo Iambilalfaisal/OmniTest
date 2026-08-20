@@ -30,6 +30,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# core.logging_config/core.run_context are deliberately imported and applied here,
+# before the heavier graph/node imports below — those are the ones that transitively
+# construct LangChain/LangSmith/Gemini clients and could plausibly log something at
+# import time. Root had NO logging configuration at all before this (confirmed: no
+# basicConfig/dictConfig anywhere in backend/) — logging.info calls were silently
+# dropped and logging.exception calls printed bare, with no timestamp or run context.
+from .core.logging_config import configure_logging  # noqa: E402
+
+configure_logging()
+
 import json
 import logging
 import uuid
@@ -45,11 +56,13 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from .core import llm_metrics
 from .core.discovery_state import DiscoveryState
 from .core.history import HistoryStore, make_history_store
 from .core.memory import make_store
 from .core.models import SiteMap, TestPlan
-from .core.run_planning import ensure_unique_test_ids
+from .core.run_context import run_id_var
+from .core.run_planning import ensure_expected_result, ensure_unique_test_ids
 from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
@@ -57,6 +70,10 @@ from .graph.discovery_graph import build_discovery_graph
 from .nodes.worker import close_sessions_for_thread
 
 EVIDENCE_DIR = Path(__file__).resolve().parent / "evidence"
+# Stage 1: floor(RPM_limit / requests_per_worker_per_minute) for WORKER_MODEL — see the
+# worked example (RPM_limit=15, requests_per_worker_per_minute=3.4 => 4) in backend/.env's
+# own comment above this same var. The "4" here is only the fallback for a completely
+# unconfigured environment; the real, reasoned value lives in .env.
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
 SSE_POLL_INTERVAL_SECONDS = float(os.getenv("SSE_POLL_INTERVAL_SECONDS", "1.0"))
 MAX_DISCOVERY_TURNS = int(os.getenv("MAX_DISCOVERY_TURNS", "20"))
@@ -176,7 +193,16 @@ class HistoryStatsResponse(BaseModel):
 
 
 def _run_config(run_id: str) -> dict:
-    return {"configurable": {"thread_id": run_id}, "max_concurrency": MAX_CONCURRENT_WORKERS}
+    # callbacks: attached once here, not per-node — LangChain propagates it through a
+    # ContextVar into every nested `.ainvoke()` the run makes, including calls that
+    # never explicitly forward `config=` (see llm_metrics.LlmUsageCallback's docstring).
+    # Only the QA run path is instrumented this way; the discovery chat's own config
+    # (_discovery_config below) is deliberately left out of Stage 0's scope.
+    return {
+        "configurable": {"thread_id": run_id},
+        "max_concurrency": MAX_CONCURRENT_WORKERS,
+        "callbacks": [llm_metrics.LlmUsageCallback(run_id)],
+    }
 
 
 async def _update_history_status(history: HistoryStore, session_id: str, status: str, *, summary: dict | None = None) -> None:
@@ -194,13 +220,23 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
     nothing automatically re-driving it; see the plan's accepted limitations.
     """
     thread_id = config["configurable"]["thread_id"]
+    # asyncio.create_task (start_run/resume_run) copies the CURRENT contextvars.Context
+    # at task-creation time, so setting this before graph.ainvoke() reaches every
+    # LangGraph-internal task it spawns afterward, including parallel Send-spawned
+    # worker branches — see core/run_context.py's docstring.
+    run_id_var.set(thread_id)
+    # Default covers the crash path below, where an exception can happen before
+    # `snapshot` is ever fetched — see the finally block's comment for why a crash
+    # counts as "finished" for llm_metrics purposes.
+    finished = True
     try:
         await graph.ainvoke(input_, config=config)
         snapshot = await graph.aget_state(config)
-        if snapshot.next:
-            await _update_history_status(history, thread_id, "paused")
-        else:
+        finished = not snapshot.next
+        if finished:
             await _update_history_status(history, thread_id, "done", summary=snapshot.values.get("summary", {}))
+        else:
+            await _update_history_status(history, thread_id, "paused")
     except Exception:
         logging.exception("run %s crashed", thread_id)
         await _update_history_status(history, thread_id, "error")
@@ -209,6 +245,15 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
         # only matters when a crash left a worker's Playwright session cached but never
         # closed, which would otherwise leak that browser subprocess forever.
         await close_sessions_for_thread(thread_id)
+        # Only discard the accumulated LLM-request counter once this run is truly
+        # over — "paused" means a human-in-the-loop interrupt is pending and _drive()
+        # runs again on resume (resume_run), reusing this SAME thread_id, and should
+        # keep accumulating onto the same total rather than restarting from zero. A
+        # crash counts as terminal too: per this function's own docstring, nothing
+        # automatically re-drives a crashed run, so the entry would otherwise leak in
+        # llm_metrics._METRICS forever.
+        if finished:
+            llm_metrics.discard(thread_id)
 
 
 def _model_dump(value):
@@ -453,13 +498,31 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
         await _update_history_status(request.app.state.history, discovery_id, "approved")
 
         candidate_plan: TestPlan = snapshot.values["candidate_plan"]
-        test_cases = ensure_unique_test_ids(candidate_plan.test_cases)
+        # ensure_expected_result: discovery_agent_node already backfills this every turn,
+        # this is defense in depth for the handoff into an actual run.
+        test_cases = ensure_expected_result(ensure_unique_test_ids(candidate_plan.test_cases))
         instruction = snapshot.values.get("starting_idea") or "(test plan authored via discovery chat)"
+
+        # CONFIRMED live: this used to be hardcoded to "" here, so any credentials the
+        # user typed into the discovery chat (the whole reason discovery_agent_node
+        # proactively asks for them — see DISCOVERY_SYSTEM_PROMPT) never reached
+        # auth_setup_node, which reads exactly this field to decide "log in with the
+        # given account" vs "sign up a fresh one." Every requires_auth case ran against
+        # a throwaway signup (or, if that signup didn't finish in auth_setup_node's turn
+        # budget, unauthenticated) instead of the real account the user provided — traced
+        # directly to a test case that should have redirected off an authenticated
+        # /login and instead just saw the plain sign-in form. Reconstructed here from the
+        # human's own chat turns (excludes the synthetic "[Current context...]" addendum
+        # and the assistant's replies), since that transcript is exactly where those
+        # credentials/preferences live.
+        discovery_context = "\n".join(
+            m["text"] for m in _discovery_transcript(snapshot.values.get("messages")) if m["role"] == "user" and m["text"]
+        )
         run_id = str(uuid.uuid4())
         initial_run_state: QAState = {
             "target_url": snapshot.values["target_url"],
             "instruction": instruction,
-            "discovery_context": "",
+            "discovery_context": discovery_context,
             "run_token": snapshot.values.get("run_token", ""),
             "test_cases": test_cases,
             "test_results": [],
