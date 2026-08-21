@@ -75,6 +75,18 @@ class HistoryStore:
                 (id, kind, target_url, label, status, parent_id),
             )
 
+    async def get_session(self, id: str) -> dict | None:
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT id, kind, target_url, label, status, summary, parent_id, created_at, updated_at
+                    FROM history_sessions WHERE id = %s
+                    """,
+                    (id,),
+                )
+                return await cur.fetchone()
+
     async def update_status(self, id: str, status: str, *, summary: dict | None = None) -> None:
         # COALESCE(%s, summary): pause/error transitions pass summary=None and leave any
         # already-stored summary value untouched.

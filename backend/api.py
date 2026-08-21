@@ -41,6 +41,7 @@ from .core.logging_config import configure_logging  # noqa: E402
 
 configure_logging()
 
+import contextlib
 import json
 import logging
 import uuid
@@ -67,9 +68,18 @@ from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
 from .graph.discovery_graph import build_discovery_graph
-from .nodes.worker import close_sessions_for_thread
+from .nodes.worker import (
+    SESSION_REAP_INTERVAL_SECONDS,
+    close_all_sessions,
+    close_idle_sessions,
+    close_sessions_for_thread,
+)
 
 EVIDENCE_DIR = Path(__file__).resolve().parent / "evidence"
+# Only ever created lazily by a run's own evidence capture (nodes/worker/evidence.py) —
+# a fresh clone with no run yet has no such directory, and StaticFiles(directory=...)
+# raises at import time (before the app can even start) if the path doesn't exist.
+EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 # Stage 1: floor(RPM_limit / requests_per_worker_per_minute) for WORKER_MODEL — see the
 # worked example (RPM_limit=15, requests_per_worker_per_minute=3.4 => 4) in backend/.env's
 # own comment above this same var. The "4" here is only the fallback for a completely
@@ -87,11 +97,34 @@ MAX_DISCOVERY_TURNS = int(os.getenv("MAX_DISCOVERY_TURNS", "20"))
 # by hitting this directly when --reload restarted mid-run during development.
 _background_tasks: set[asyncio.Task] = set()
 
+# thread_ids with a live _drive() task right now — so close_idle_sessions' periodic
+# sweep (below) never reaps a session out from under a run that is actively executing a
+# node (as opposed to genuinely paused). A long Gemini backoff inside one node can go
+# quiet for minutes; that must not look like an abandoned pause. Deliberately a
+# separate set from _background_tasks, not derived from it, since membership here needs
+# to start/end exactly at _drive()'s own start/finally, not at task-object lifetime.
+_active_threads: set[str] = set()
+
 
 def _track(task: asyncio.Task) -> asyncio.Task:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
+
+
+async def _reap_idle_sessions_forever() -> None:
+    """Periodic backstop for the one leak api.py's own pause-safety guard (see
+    `_drive()`'s `finally` below) deliberately accepts: a run that paused for a human
+    and was then never resumed. Started in `lifespan()`, held in a plain local variable
+    there rather than passed through `_track()` — `_background_tasks` is gathered on
+    shutdown, and gathering an infinite loop would hang shutdown forever.
+    """
+    while True:
+        await asyncio.sleep(SESSION_REAP_INTERVAL_SECONDS)
+        try:
+            await close_idle_sessions(exempt_threads=_active_threads)
+        except Exception:
+            logging.exception("idle Playwright session reaper tick failed — retrying next tick")
 
 
 @asynccontextmanager
@@ -120,15 +153,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         app.state.run_graph = build_graph(checkpointer, store=store)
         app.state.discovery_graph = build_discovery_graph(checkpointer, store=store)
-        yield
 
-        if _background_tasks:
-            logging.info(
-                "Shutting down — waiting for %d in-flight run(s) to reach their next "
-                "checkpoint before closing database connections...",
-                len(_background_tasks),
-            )
-            await asyncio.gather(*_background_tasks, return_exceptions=True)
+        reaper = asyncio.create_task(_reap_idle_sessions_forever())
+        try:
+            yield
+        finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+
+            if _background_tasks:
+                logging.info(
+                    "Shutting down — waiting for %d in-flight run(s) to reach their next "
+                    "checkpoint before closing database connections...",
+                    len(_background_tasks),
+                )
+                await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+            # After the gather above, so a run that reaches verdict_node on its way to
+            # its next checkpoint still gets to close its own session (and capture its
+            # evidence) first — this only mops up what's left, including runs that are
+            # currently paused for a human who never got to respond before shutdown.
+            await close_all_sessions()
 
 
 app = FastAPI(title="OmniTest Engine", lifespan=lifespan)
@@ -225,9 +271,10 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
     # LangGraph-internal task it spawns afterward, including parallel Send-spawned
     # worker branches — see core/run_context.py's docstring.
     run_id_var.set(thread_id)
+    _active_threads.add(thread_id)
     # Default covers the crash path below, where an exception can happen before
     # `snapshot` is ever fetched — see the finally block's comment for why a crash
-    # counts as "finished" for llm_metrics purposes.
+    # counts as "finished" for llm_metrics AND session-cleanup purposes.
     finished = True
     try:
         await graph.ainvoke(input_, config=config)
@@ -241,18 +288,37 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
         logging.exception("run %s crashed", thread_id)
         await _update_history_status(history, thread_id, "error")
     finally:
-        # No-op on the happy path (verdict_node already closed its own session) — this
-        # only matters when a crash left a worker's Playwright session cached but never
-        # closed, which would otherwise leak that browser subprocess forever.
-        await close_sessions_for_thread(thread_id)
-        # Only discard the accumulated LLM-request counter once this run is truly
-        # over — "paused" means a human-in-the-loop interrupt is pending and _drive()
-        # runs again on resume (resume_run), reusing this SAME thread_id, and should
-        # keep accumulating onto the same total rather than restarting from zero. A
-        # crash counts as terminal too: per this function's own docstring, nothing
-        # automatically re-drives a crashed run, so the entry would otherwise leak in
-        # llm_metrics._METRICS forever.
+        _active_threads.discard(thread_id)
+        # Guarded by `finished` for the SAME reason llm_metrics.discard below it already
+        # was — this guard was previously MISSING here, which was a real, confirmed bug.
+        # On a PAUSE, graph.ainvoke() above RETURNS NORMALLY with `__interrupt__` in its
+        # output rather than raising (confirmed against the installed langgraph 1.2.11:
+        # pregel/_loop.py's __aexit__ suppresses GraphInterrupt for a non-nested graph),
+        # so this `finally` used to run at every human-in-the-loop pause and close the
+        # very Playwright session the paused worker is about to resume against.
+        # tool_node calls interrupt() BEFORE its get_session() (nodes/worker/nodes.py),
+        # so the resumed node cache-missed and transparently opened a fresh, unnavigated
+        # browser: an ask_human resume's "fresh snapshot" snapshotted about:blank, an
+        # approved risky action ran against a blank page, and re-opening the session
+        # silently overwrote the pre-pause video recording. A pause is not a terminal
+        # state — nothing here should be torn down.
+        #
+        # Every genuine leak is still reaped: `finished` defaults to True above, so the
+        # crash path (ainvoke or aget_state raising) still sweeps here, and
+        # _update_history_status swallows its own exceptions so it can never strand
+        # this at False. The one case this deliberately gives up on — a run that pauses
+        # and is NEVER resumed — is covered by close_idle_sessions' TTL reaper
+        # (_reap_idle_sessions_forever, started in lifespan()) and by close_all_sessions()
+        # on shutdown.
         if finished:
+            await close_sessions_for_thread(thread_id)
+            # Only discard the accumulated LLM-request counter once this run is truly
+            # over — "paused" means a human-in-the-loop interrupt is pending and
+            # _drive() runs again on resume (resume_run), reusing this SAME thread_id,
+            # and should keep accumulating onto the same total rather than restarting
+            # from zero. A crash counts as terminal too: per this function's own
+            # docstring, nothing automatically re-drives a crashed run, so the entry
+            # would otherwise leak in llm_metrics._METRICS forever.
             llm_metrics.discard(thread_id)
 
 
@@ -267,8 +333,32 @@ def _pending_interrupts(snapshot) -> list[dict]:
     return [{"id": intr.id, "type": intr.value.get("type"), "payload": intr.value} for intr in snapshot.interrupts]
 
 
+async def _run_exists(history: HistoryStore, run_id: str, snapshot) -> bool:
+    """A checkpoint's `snapshot.values` is empty in two indistinguishable-by-itself
+    cases: the run_id was never created, OR `start_run`/`send_discovery_message`'s
+    `history.create_session()` has already returned but the graph's first checkpoint
+    write hasn't landed yet (a real window — `_drive()` is fired via
+    `asyncio.create_task` and is not awaited before the route handler returns). Treating
+    the second case as 404 was a genuine race: a client that calls GET /runs/{id}/events
+    immediately after POST /runs (exactly what a normal client does) could see a 404 for
+    a run_id that is, in fact, valid and about to make progress. The history row is
+    written first and synchronously, so checking it too closes the window.
+    """
+    if snapshot.values:
+        return True
+    return await history.get_session(run_id) is not None
+
+
 def _discovery_config(discovery_id: str) -> dict:
-    return {"configurable": {"thread_id": discovery_id}}
+    # Attaches the same LlmUsageCallback _run_config() uses for an actual run.
+    # discovery_agent_node calls PLANNER_MODEL every turn (nodes/discovery.py) and is
+    # the entry point most users actually start from — leaving it uninstrumented left
+    # the majority of planning-phase quota usage invisible to llm_metrics, despite
+    # quota being the documented binding constraint on this system.
+    return {
+        "configurable": {"thread_id": discovery_id},
+        "callbacks": [llm_metrics.LlmUsageCallback(discovery_id)],
+    }
 
 
 def _discovery_turn_payload(snapshot) -> dict:
@@ -307,6 +397,7 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
         "test_results": [],
         "summary": {},
         "plan_approved": False,
+        "auth_storage_state": None,
     }
     # Insert BEFORE firing _drive() so a client hitting GET /history immediately after
     # this call always sees the row.
@@ -326,7 +417,7 @@ async def resume_run(run_id: str, req: ResumeRequest, request: Request) -> dict:
     graph = request.app.state.run_graph
     config = {"configurable": {"thread_id": run_id}}
     snapshot = await graph.aget_state(config)
-    if not snapshot.values:
+    if not await _run_exists(request.app.state.history, run_id, snapshot):
         raise HTTPException(status_code=404, detail="unknown run_id")
 
     pending_ids = {i["id"] for i in _pending_interrupts(snapshot)}
@@ -351,10 +442,11 @@ async def resume_run(run_id: str, req: ResumeRequest, request: Request) -> dict:
 @app.get("/runs/{run_id}/events")
 async def run_events(run_id: str, request: Request) -> EventSourceResponse:
     graph = request.app.state.run_graph
+    history = request.app.state.history
     config = {"configurable": {"thread_id": run_id}}
 
     snapshot = await graph.aget_state(config)
-    if not snapshot.values:
+    if not await _run_exists(history, run_id, snapshot):
         raise HTTPException(status_code=404, detail="unknown run_id")
 
     async def event_stream() -> AsyncIterator[dict]:
@@ -363,6 +455,20 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
             snapshot = await graph.aget_state(config)
             pending = _pending_interrupts(snapshot)
             pending_ids = frozenset(i["id"] for i in pending)
+
+            # Checked BEFORE the `not snapshot.next` done-branch below: a crashed run
+            # (retries exhausted inside a node, `_drive()`'s `except Exception` caught
+            # it) leaves `snapshot.next` truthy — LangGraph doesn't clear the pending
+            # task just because it failed — and there are no pending interrupts either,
+            # so without this check every tick fell into the `progress` branch below and
+            # this stream ran `while True` forever, once a second, with the client never
+            # told the run was dead. history_sessions is the only place "crashed" is
+            # actually recorded (_drive's `_update_history_status(..., "error")`); the
+            # checkpoint itself has no error status of its own.
+            row = await history.get_session(run_id)
+            if row and row["status"] == "error":
+                yield {"event": "error", "data": json.dumps({"message": "run crashed", "run_id": run_id})}
+                return
 
             if pending_ids and pending_ids != emitted_interrupt_ids:
                 emitted_interrupt_ids = pending_ids
@@ -394,6 +500,43 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
             await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
 
     return EventSourceResponse(event_stream())
+
+
+@app.post("/runs/{run_id}/retry")
+async def retry_run(run_id: str, request: Request) -> dict:
+    """Re-drives a crashed run from its last good checkpoint. `_drive()`'s own
+    docstring has always admitted a crash "leaves the checkpoint stalled with nothing
+    automatically re-driving it" — this is that missing re-drive, made explicit and
+    human-triggered rather than automatic (an automatic retry loop on a genuinely
+    broken plan/site would just burn quota re-failing the same way).
+    """
+    graph = request.app.state.run_graph
+    history = request.app.state.history
+    config = {"configurable": {"thread_id": run_id}}
+
+    row = await history.get_session(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown run_id")
+    if row["status"] != "error":
+        raise HTTPException(status_code=409, detail=f"run is not in an error state (status: {row['status']})")
+
+    snapshot = await graph.aget_state(config)
+    if not snapshot.next:
+        # The checkpoint says the run actually finished (or a resume already fixed it)
+        # even though history still says "error" — nothing left to re-drive. This can
+        # only happen if a previous retry succeeded but its history update raced this
+        # request; safer to say so than to silently re-run a finished graph.
+        raise HTTPException(status_code=409, detail="run has no pending work to resume")
+
+    await _update_history_status(history, run_id, "running")
+    # input_=None: NOT Command(resume=...) — there is no pending interrupt to answer,
+    # just a superstep that never finished writing its checkpoint because the process
+    # died mid-node. Invoking again with no new input re-plans from the last
+    # successfully checkpointed state, which re-executes exactly that unfinished
+    # superstep — the same fault-tolerance mechanism LangGraph documents for resuming a
+    # thread after a crash, distinct from the interrupt-resume path resume_run uses.
+    _track(asyncio.create_task(_drive(graph, None, _run_config(run_id), history)))
+    return {"status": "retrying", "run_id": run_id}
 
 
 @app.get("/runs/{run_id}/report")
@@ -431,6 +574,7 @@ async def start_discovery(req: DiscoveryStartRequest, request: Request) -> dict:
         "run_token": "",
         "turn_count": 0,
         "status": "in_progress",
+        "pending_dive": None,
     }
     await request.app.state.history.create_session(
         id=discovery_id,
@@ -491,11 +635,17 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
     status = snapshot.values.get("status")
 
     if status == "cancelled":
-        await _update_history_status(request.app.state.history, discovery_id, "cancelled")
+        await _update_history_status(
+            request.app.state.history, discovery_id, "cancelled", summary={"llm": llm_metrics.snapshot(discovery_id)}
+        )
+        llm_metrics.discard(discovery_id)
         return {"status": "cancelled"}
 
     if status == "approved":
-        await _update_history_status(request.app.state.history, discovery_id, "approved")
+        await _update_history_status(
+            request.app.state.history, discovery_id, "approved", summary={"llm": llm_metrics.snapshot(discovery_id)}
+        )
+        llm_metrics.discard(discovery_id)
 
         candidate_plan: TestPlan = snapshot.values["candidate_plan"]
         # ensure_expected_result: discovery_agent_node already backfills this every turn,
@@ -528,6 +678,7 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
             "test_results": [],
             "summary": {},
             "plan_approved": True,
+            "auth_storage_state": None,
         }
         try:
             await request.app.state.history.create_session(

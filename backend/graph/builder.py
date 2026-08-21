@@ -8,7 +8,7 @@ from langgraph.types import Send, interrupt
 from ..core.llm import LLM_RETRY_POLICY
 from ..core.models import TestCase
 from ..core.state import QAState
-from ..nodes.auth_setup import auth_setup_node
+from ..nodes.auth import build_auth_subgraph
 from ..nodes.memory import memory_node
 from ..nodes.planner import planner_node
 from ..nodes.reporter import reporter_node
@@ -77,7 +77,9 @@ def build_graph(checkpointer, store=None):
 
     graph.add_node("planner_node", planner_node, retry_policy=LLM_RETRY_POLICY)
     graph.add_node("plan_review_node", plan_review_node)
-    graph.add_node("auth_setup_node", auth_setup_node, retry_policy=LLM_RETRY_POLICY)
+    # Subgraph-as-node, like worker_node below — no retry_policy at this level, since
+    # each of its own nodes (nodes/auth/nodes.py) already carries its own.
+    graph.add_node("auth_setup_node", build_auth_subgraph())
     graph.add_node("worker_node", build_worker_subgraph())
     graph.add_node("reporter_node", reporter_node)
     graph.add_node("memory_node", memory_node)

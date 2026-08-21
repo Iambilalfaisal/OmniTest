@@ -4,9 +4,10 @@ Postgres via pgvector and retrieved by planner_node before drafting a new plan.
 Shares the same Postgres database as the checkpointer (backend/graph/checkpointer.py)
 — same DATABASE_URL — via its own connection pool rather than a literally shared pool
 object, since AsyncPostgresStore's exact pool-sharing API wasn't confirmed available.
-pgvector is confirmed installed and enabled on this database (built from source on
-Windows via VS Build Tools + nmake, since no prebuilt binaries or Stack Builder option
-existed for this Postgres install).
+Called far less often than the checkpointer (~2x per run vs. once per superstep), so its
+pool is sized smaller. pgvector is confirmed installed and enabled on this database
+(built from source on Windows via VS Build Tools + nmake, since no prebuilt binaries or
+Stack Builder option existed for this Postgres install).
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from .models import SiteMemory, SiteMap
 
 MEMORY_NAMESPACE = "site_memory"
 DATABASE_URL = os.environ["DATABASE_URL"]  # required — fail fast at import time
+MEMORY_POOL_MAX_SIZE = int(os.getenv("MEMORY_POOL_MAX_SIZE", "5"))
 
 # Direct-key (not embedding-search) slot in the same per-domain namespace SiteMemory
 # facts use — a crawled site map is structured data, not a prose fact worth embedding.
@@ -48,8 +50,16 @@ def get_embeddings() -> GoogleGenerativeAIEmbeddings:
 @asynccontextmanager
 async def make_store() -> AsyncIterator[AsyncPostgresStore]:
     dims = int(os.environ["MEMORY_EMBEDDING_DIMS"])
+    # pool_config, not a bare connection string — confirmed against the installed
+    # langgraph-checkpoint-postgres 3.1.2 that from_conn_string builds and owns an
+    # AsyncConnectionPool internally when this is set (falling back to a single
+    # AsyncConnection otherwise, which is what this used to run on). A single
+    # connection here was a smaller risk than the checkpointer's — this store is only
+    # touched ~twice per run (planner_node's read, memory_node's write) — but still
+    # serializes concurrent runs' memory reads/writes against each other for no reason.
     async with AsyncPostgresStore.from_conn_string(
         DATABASE_URL,
+        pool_config={"min_size": 1, "max_size": MEMORY_POOL_MAX_SIZE},
         index={"dims": dims, "embed": get_embeddings(), "fields": ["summary"]},
     ) as store:
         await store.setup()  # idempotent DDL — creates the pgvector-backed store tables

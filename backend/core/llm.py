@@ -14,6 +14,7 @@ tool-call exception, a connection drop before a request is even sent).
 """
 from __future__ import annotations
 
+import logging
 import os
 from enum import Enum
 
@@ -22,6 +23,7 @@ from enum import Enum
 # alongside it since langchain_google_genai imports it directly itself.
 from google.genai.errors import APIError
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.types import RetryPolicy, default_retry_on
 
 # Total HTTP attempts INCLUDING the original request (confirmed against the installed
@@ -113,6 +115,111 @@ def rate_limit_class(err: APIError) -> str | None:
     if "perday" in haystack:
         return "rpd"
     return "rpm"
+
+
+# Per-role OpenRouter model id, e.g. "openai/gpt-oss-20b:free" — optional. Unset (the
+# default) means that role has no fallback and behaves exactly as before this existed.
+# MEMORY has no entry: get_memory_manager() (core/memory.py) hands its model straight to
+# langmem's create_memory_manager(), which does its own internal bind_tools/
+# with_structured_output wiring — a fallback swapped in here wouldn't have those
+# BaseChatModel methods for langmem to call, so MEMORY_MODEL has no fallback for now.
+_FALLBACK_ROLE_ENV: dict[ModelRole, str] = {
+    ModelRole.PLANNER: "PLANNER_FALLBACK_MODEL",
+    ModelRole.WORKER: "WORKER_FALLBACK_MODEL",
+    ModelRole.VERDICT: "VERDICT_FALLBACK_MODEL",
+}
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _build_fallback_model(role: ModelRole, *, temperature: float, **kwargs) -> ChatOpenAI | None:
+    model_name = os.environ.get(_FALLBACK_ROLE_ENV.get(role, ""))
+    if not model_name:
+        return None
+    # OPENROUTER_API_KEY is only required once a fallback model is actually configured
+    # AND the primary actually fails — checked here (not at import time) so a role with
+    # no fallback configured never needs this var at all.
+    return ChatOpenAI(
+        model=model_name,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        temperature=temperature,
+        **kwargs,
+    )
+
+
+def _is_fallback_worthy(exc: BaseException) -> bool:
+    """429 (rate/quota — RPM or RPD) or 5xx: the classes an SDK-level retry has already
+    had its shot at and a NODE-level retry (same provider, same request) can't fix
+    either — RPD doesn't clear same-day, a persistent 5xx isn't transient. Deliberately
+    narrower than "any Gemini error": a genuine 400 (a real bug in our own request
+    shape) should surface loudly instead of being masked behind an unrelated OpenRouter
+    failure — see node_retry_on's docstring for the same reasoning applied to node
+    retries instead of cross-provider fallback.
+    """
+    api_error = find_gemini_api_error(exc)
+    if api_error is None:
+        return False
+    return rate_limit_class(api_error) is not None or api_error.code >= 500
+
+
+class _ChatModelWithFallback:
+    """Wraps an already-fully-composed primary chain (e.g.
+    `get_chat_model(role).with_structured_output(Schema)`) with a same-shape fallback
+    chain built from an OpenRouter model. Deliberately NOT built by calling
+    `Runnable.with_fallbacks()` on the bare chat model before `.with_structured_output()`/
+    `.bind_tools()`: `with_fallbacks()` returns a `RunnableWithFallbacks`, which is not a
+    `BaseChatModel` and so loses exactly those methods every call site in this codebase
+    chains on afterward. Composing chain_fn onto each model first (see `with_fallback()`
+    below) and wrapping the RESULT instead sidesteps that — this class only ever needs
+    `.ainvoke()`, which is all any call site in this codebase actually calls.
+
+    The fallback chain itself is built lazily, on first actual use inside `ainvoke()`,
+    NOT in `__init__`/`with_fallback()` — `_build_fallback_model()` requires
+    OPENROUTER_API_KEY, and building it eagerly would mean a blank/invalid key breaks
+    EVERY call the moment a `*_FALLBACK_MODEL` is configured, even on the (normal) path
+    where the primary Gemini call succeeds and the fallback is never needed. Confirmed
+    directly: this was the shape of the bug before the fix (`ChatOpenAI.__init__`
+    itself raises on a blank key, before any Gemini call ever happens).
+    """
+
+    def __init__(self, primary, role: ModelRole, chain_fn, temperature: float, kwargs: dict):
+        self._primary = primary
+        self._role = role
+        self._chain_fn = chain_fn
+        self._temperature = temperature
+        self._kwargs = kwargs
+        self._fallback = None
+
+    async def ainvoke(self, *args, **kwargs):
+        try:
+            return await self._primary.ainvoke(*args, **kwargs)
+        except Exception as exc:
+            if not _is_fallback_worthy(exc):
+                raise
+            logging.warning(
+                "%s role's primary model failed (%s) — falling back to OpenRouter", self._role.value, exc
+            )
+            if self._fallback is None:
+                fallback_model = _build_fallback_model(self._role, temperature=self._temperature, **self._kwargs)
+                self._fallback = self._chain_fn(fallback_model)
+            return await self._fallback.ainvoke(*args, **kwargs)
+
+
+def with_fallback(role: ModelRole, chain_fn, *, temperature: float = 0.0, **kwargs):
+    """`chain_fn` is whatever a call site would otherwise chain directly onto
+    `get_chat_model(role, ...)` — e.g. `lambda m: m.with_structured_output(Schema)` or
+    `lambda m: m.bind_tools(tools)`. Applies it to the primary Gemini model now, and — if
+    `role` has a fallback model configured (see `_FALLBACK_ROLE_ENV`) — arranges to apply
+    it to an OpenRouter model LATER, only if the primary actually fails with a
+    rate-limit/server error (see `_is_fallback_worthy`, `_ChatModelWithFallback`).
+    Returns just `chain_fn(primary)` — identical to today's direct-chaining call sites —
+    when no fallback is configured for this role.
+    """
+    primary = chain_fn(get_chat_model(role, temperature=temperature, **kwargs))
+    if not os.environ.get(_FALLBACK_ROLE_ENV.get(role, "")):
+        return primary
+    return _ChatModelWithFallback(primary, role, chain_fn, temperature, kwargs)
 
 
 def node_retry_on(exc: Exception) -> bool:

@@ -1,22 +1,25 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-langgraph>=0.2  # needs interrupt()/Command/RetryPolicy/max_concurrency support — verify this floor actually includes them, bump if not
-langgraph-checkpoint-postgres  # AsyncPostgresSaver + AsyncPostgresStore (confirmed both live here) — checkpointing + pgvector long-term memory
-psycopg[binary,pool]>=3.1  # async driver + pool backing AsyncPostgresSaver/AsyncPostgresStore
-langchain-mcp-adapters>=0.1
-langchain-google-genai  # ChatGoogleGenerativeAI + GoogleGenerativeAIEmbeddings (Gemini)
-langchain-core>=0.3
-langmem  # long-term memory extraction — pin an actual released version once confirmed on PyPI
-pydantic>=2.8
-sse-starlette>=2.1
-python-dotenv>=1.0
-langsmith>=0.1
+fastapi~=0.141
+uvicorn[standard]~=0.52
+# Pinned to the installed minor version, not just floored — this system depends on
+# subtle, version-specific LangGraph semantics (subgraph state merge by field name,
+# interrupt()/GraphInterrupt suppression on resume, Send-based fan-out not cancelling
+# siblings on a sibling's interrupt) with no test suite to catch a break if a bump
+# changes any of them. Confirmed against the installed 1.2.11 that interrupt()/Command/
+# RetryPolicy/max_concurrency all work as this codebase assumes; re-verify by hand
+# before bumping past 1.2.x.
+langgraph~=1.2.11
+langgraph-checkpoint-postgres~=3.1.2  # AsyncPostgresSaver + AsyncPostgresStore (confirmed both live here) — checkpointing + pgvector long-term memory
+psycopg[binary,pool]~=3.3.4  # async driver + pool backing AsyncPostgresSaver/AsyncPostgresStore
+langchain-mcp-adapters~=0.3.2
+langchain-google-genai~=4.3.4  # ChatGoogleGenerativeAI + GoogleGenerativeAIEmbeddings (Gemini)
+langchain-core~=1.5.5
+langchain-openai~=1.5.1  # ChatOpenAI, pointed at OpenRouter's base_url — core/llm.py's with_fallback()
+langmem==0.0.30  # long-term memory extraction — still pre-1.0; pin exact until it stabilizes
+pydantic~=2.13.4
+sse-starlette~=3.4.8
+python-dotenv~=1.2.3
+langsmith~=0.11.0
 
-# Alternative providers — uncomment + swap the model classes in nodes/planner.py,
-# nodes/worker.py, and core/memory.py if you switch away from Gemini:
-# langchain-openai>=0.2      # ChatOpenAI / OpenAIEmbeddings, needs OPENAI_API_KEY
-# langchain-anthropic>=0.3   # ChatAnthropic, needs ANTHROPIC_API_KEY (no embeddings offering)
-
-# Dev/test only — backend/tests/. pythonpath ini option (pytest.ini) needs pytest>=7.
-pytest>=7.0
-pytest-asyncio>=0.24
+# Alternative/additional providers — uncomment if you want a full switch away from Gemini
+# rather than core/llm.py's OpenRouter fallback (langchain-openai, above):
+# langchain-anthropic~=1.5.6   # ChatAnthropic, needs ANTHROPIC_API_KEY (no embeddings offering)

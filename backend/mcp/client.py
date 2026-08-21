@@ -33,7 +33,7 @@ PLAYWRIGHT_MCP_ARGS = os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@lates
 # nodes/worker.py's evidence capture, plus a few extra low-risk tools (browser_annotate,
 # browser_highlight, video-chapter tools) as a side effect, since we bind everything
 # indiscriminately. storage opts into browser_storage_state/browser_set_storage_state,
-# used by nodes/auth_setup.py (Stage 3) to capture one shared login once and restore it
+# used by nodes/auth/nodes.py (Stage 3) to capture one shared login once and restore it
 # into each requires_auth TestCase's own isolated browser, instead of every such case
 # paying its own ~15-turn signup/login tax.
 #

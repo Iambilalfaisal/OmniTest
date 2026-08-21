@@ -26,3 +26,10 @@ class DiscoveryState(TypedDict):
                     # across revisions instead of changing every turn.
     turn_count: int
     status: Literal["in_progress", "approved", "cancelled"]
+    # A URL discovery_agent_node requested a closer look at (via explore_more) but has
+    # not yet crawled — set at the end of the turn that requested it, consumed at the
+    # START of the NEXT turn, rather than crawled inline in the same turn. Crawling
+    # inline used to cost a second, largely redundant LLM call every time the model
+    # asked for a dive (nodes/discovery.py's module docstring has the full rationale).
+    # None when no dive is pending.
+    pending_dive: str | None

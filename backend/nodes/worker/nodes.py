@@ -16,16 +16,24 @@ import os
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from ...core.llm import LLM_RETRY_POLICY, ModelRole, get_chat_model
+from ...core.llm import LLM_RETRY_POLICY, ModelRole, with_fallback
 from ...core.models import TestResult
 from ...core.run_context import test_id_var
 from ...core.state import WorkerState
+from ..agent_loop import (
+    ASK_HUMAN_TOOL_NAME,
+    EXCLUDED_TOOL_NAMES,
+    ask_human_and_reply,
+    ask_human_tool,
+    compact_history,
+    review_if_risky,
+    stale_snapshot_replacements,
+    truncate_tool_result,
+)
 from .evidence import capture_screenshot, ensure_action_overlay, run_dir_for, stop_and_capture
 from .session import discard_session, get_session, session_key
-from .tools import ASK_HUMAN_TOOL_NAME, ask_human_tool
 
 # Stage 2: dropped from a hardcoded 20 to an env-tunable default of 8. 20 was set
 # before two request-reducing fixes landed: multi-action turns (below, WORKER_SYSTEM_PROMPT)
@@ -36,28 +44,6 @@ from .tools import ASK_HUMAN_TOOL_NAME, ask_human_tool
 # downside while multi-action turns keep a legitimate flow from actually needing more
 # turns to fit the same steps. Override via env if a specific site's flows need more.
 MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "8"))
-
-# Backstop cap on any single tool result's size before it enters message history —
-# without this, a large tool result (most commonly browser_snapshot's accessibility
-# tree on a complex page) gets resent in full on every subsequent turn of this same
-# test case's loop, compounding token cost across up to MAX_TOOL_TURNS turns.
-MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "8000"))
-
-# Never offered to the worker model at all — not a prompt instruction, a hard
-# exclusion. Found directly from live runs: the model defaulted to
-# `browser_run_code_unsafe` (arbitrary JS in the PLAYWRIGHT SERVER PROCESS, per its own
-# tool description — a materially bigger privilege than page-sandboxed JS) for
-# completely routine actions it already has dedicated tools for — filling a textbox,
-# clicking a button/link, even just logging page content — turning nearly every single
-# turn into a risky_action pause. A stronger prompt instruction wasn't tried first here
-# because the same class of fix (a soft instruction) already proved unreliable for
-# ask_human in this exact codebase. Removing the tool is deterministic, costs nothing
-# (no prompt tokens spent trying to talk it out of a tool it can't see), and there's no
-# legitimate QA-testing need for server-process-level code execution — `browser_click`,
-# `browser_type`, `browser_fill_form`, `browser_select_option`, and `browser_evaluate`
-# (page-sandboxed JS, a materially smaller privilege) already cover everything a test
-# step should need.
-EXCLUDED_TOOL_NAMES = frozenset({"browser_run_code_unsafe"})
 
 WORKER_SYSTEM_PROMPT = """You are a QA test executor. You control a real browser through \
 the tools available to you (Playwright, driven by the accessibility tree — call \
@@ -130,13 +116,6 @@ happen or what "should" have happened; only what was on screen. A negative test 
 input was correctly rejected counts as completed — that needs no `ask_human` call.
 """
 
-# Genuinely destructive/irreversible actions only. "confirm" and "submit" are
-# deliberately NOT here — they matched almost every ordinary form interaction (login,
-# signup, "create agent", contact forms), pausing for human review on essentially every
-# step instead of only when something real is at stake — found directly from a report
-# that risky-action review was firing "after every agent step."
-RISKY_KEYWORDS = ("delete", "purchase", "buy", "pay", "remove")
-
 # What "Pass" means for each TestCase.category — without this, the worker/verdict LLMs
 # have no way to tell that a `negative` case is SUPPOSED to be rejected by the site.
 _CATEGORY_PASS_NOTES = {
@@ -170,19 +149,6 @@ def _expected_result(test_case) -> str:
     return (getattr(test_case, "expected_result", None) or "").strip() or _NO_EXPECTED_RESULT
 
 
-def _is_risky(call: dict) -> bool:
-    # Any tool whose name itself says "unsafe" (e.g. browser_run_code_unsafe — arbitrary
-    # JS execution in the page) is ALWAYS risky, regardless of what its args happen to
-    # contain — found by reproducing a real pause where this call only got flagged
-    # because the generated code string happened to contain "submit"; without this,
-    # the exact same tool call generating different code wouldn't have been caught at
-    # all, silently letting the agent run arbitrary code un-reviewed.
-    if "unsafe" in call["name"].lower():
-        return True
-    haystack = f"{call['name']} {call.get('args', {})}".lower()
-    return any(word in haystack for word in RISKY_KEYWORDS)
-
-
 def _recent_consecutive_tool_calls(history: list, tool_name: str) -> int:
     """How many times `tool_name` was just called in a row, most recent first, before
     any other tool result breaks the streak."""
@@ -193,59 +159,6 @@ def _recent_consecutive_tool_calls(history: list, tool_name: str) -> int:
         elif isinstance(m, ToolMessage):
             break
     return count
-
-
-def _truncate_tool_result(text: str) -> str:
-    if len(text) <= MAX_TOOL_RESULT_CHARS:
-        return text
-    omitted = len(text) - MAX_TOOL_RESULT_CHARS
-    return f"{text[:MAX_TOOL_RESULT_CHARS]}\n...[truncated {omitted} more characters — call browser_snapshot again if you need the full current state]"
-
-
-# Marks a `browser_snapshot` embedded inside an ask_human reply (see tool_node) so
-# _compact_history can find and trim it too — that message is named "ask_human", not
-# "browser_snapshot", since its tool_call_id must match the ask_human call it's
-# replying to.
-_EMBEDDED_SNAPSHOT_MARKER = "\n\n[Fresh snapshot taken after waiting for this answer"
-
-
-def _compact_history(history: list) -> list:
-    """Collapses every stale `browser_snapshot` result — whether it's its own tool
-    message or embedded inside an ask_human reply — down to a short placeholder for
-    THIS call only, keeping just the most recent one in full. The real, untruncated
-    history stays in WorkerState/the checkpoint untouched; this only affects what's
-    sent to the model.
-
-    An earlier snapshot reflects a page state the agent has almost always already
-    acted on or navigated past; resending every one of them in full on every
-    subsequent turn is the single biggest driver of this loop's token cost (each
-    browser_snapshot result can be thousands of tokens on a complex page, and a plain
-    full-history resend compounds that across up to MAX_TOOL_TURNS turns).
-    """
-
-    def is_plain_snapshot(m) -> bool:
-        return isinstance(m, ToolMessage) and m.name == "browser_snapshot"
-
-    def has_embedded_snapshot(m) -> bool:
-        return isinstance(m, ToolMessage) and _EMBEDDED_SNAPSHOT_MARKER in str(m.content)
-
-    snapshot_indices = [i for i, m in enumerate(history) if is_plain_snapshot(m) or has_embedded_snapshot(m)]
-    if len(snapshot_indices) <= 1:
-        return history
-
-    compacted = list(history)
-    placeholder = "[earlier snapshot omitted to save context — call browser_snapshot again if you need current element refs]"
-    for i in snapshot_indices[:-1]:
-        m = compacted[i]
-        if is_plain_snapshot(m):
-            compacted[i] = ToolMessage(content=placeholder, tool_call_id=m.tool_call_id, name=m.name)
-        else:
-            # ask_human reply with an embedded snapshot — keep the human's actual
-            # answer (durable context the model still needs), drop just the stale
-            # snapshot text appended after it.
-            answer_part = str(m.content).split(_EMBEDDED_SNAPSHOT_MARKER, 1)[0]
-            compacted[i] = ToolMessage(content=f"{answer_part}\n\n{placeholder}", tool_call_id=m.tool_call_id, name=m.name)
-    return compacted
 
 
 class Verdict(BaseModel):
@@ -273,7 +186,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     history = state.get("messages")
     seed: list = []
     if not history:
-        # Stage 3: inject the shared login (nodes/auth_setup.py) BEFORE the model's first
+        # Stage 3: inject the shared login (nodes/auth/nodes.py) BEFORE the model's first
         # turn, not after — it must land before this test case's own browser_navigate,
         # since a storage-state restore only affects requests made after it, not
         # anything the browser already loaded. Best-effort: a failure here is logged and
@@ -284,7 +197,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         set_storage_state_tool = tool_map.get("browser_set_storage_state")
         if test_case.requires_auth and auth_state and set_storage_state_tool is not None:
             try:
-                # auth_state is a file path (see nodes/auth_setup.py) — confirmed against
+                # auth_state is a file path (see nodes/auth/nodes.py) — confirmed against
                 # the installed @playwright/mcp's tool schema that browser_set_storage_state
                 # restores from a file via `filename`, not an inline blob.
                 await set_storage_state_tool.ainvoke({"filename": auth_state})
@@ -318,14 +231,24 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         ]
         history = seed
 
+    # Computed once, before the outbound call, and returned below alongside this turn's
+    # response — that's what makes the compaction land in the checkpoint (WorkerState's
+    # add_messages reducer replaces each of these in place by id) rather than only
+    # shrinking what gets sent to the model. See agent_loop.stale_snapshot_replacements
+    # for why this is safe to persist and compact_history for the outbound-only
+    # counterpart.
+    replacements = stale_snapshot_replacements(history)
+
     # 0.3, not 0 — some Gemini variants (confirmed via a runtime warning against the
     # configured WORKER_MODEL) use fixed sampling defaults and ignore temperature=0
     # specifically; a non-zero value is more likely to actually take effect.
-    model = get_chat_model(ModelRole.WORKER, temperature=0.3)
-    response = await model.bind_tools([*offered_tools, ask_human_tool]).ainvoke(_compact_history(history))
+    model = with_fallback(
+        ModelRole.WORKER, lambda m: m.bind_tools([*offered_tools, ask_human_tool]), temperature=0.3
+    )
+    response = await model.ainvoke(compact_history(history))
 
     return {
-        "messages": [*seed, response],
+        "messages": [*seed, *replacements, response],
         "pending_tool_calls": response.tool_calls,
         "turn_count": state.get("turn_count", 0) + 1,
     }
@@ -335,66 +258,33 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_id_var.set(state["test_case"].test_id)  # see agent_node's comment
     call, remaining = state["pending_tool_calls"][0], state["pending_tool_calls"][1:]
 
-    # Checked BEFORE _is_risky, not after: _is_risky substring-matches RISKY_KEYWORDS
-    # against "{name} {args}" — a clarifying question whose text happens to contain one
-    # of those words (e.g. mentions "removing" something) would otherwise be misrouted
-    # into the risky_action branch — wrong payload shape, and on "approve" would
-    # KeyError looking up "ask_human" in tool_map below, where it's never added.
+    # Checked BEFORE review_if_risky, not after: agent_loop._is_risky substring-matches
+    # RISKY_KEYWORDS against "{name} {args}" — a clarifying question whose text happens
+    # to contain one of those words (e.g. mentions "removing" something) would
+    # otherwise be misrouted into the risky_action branch — wrong payload shape, and on
+    # "approve" would KeyError looking up "ask_human" in tool_map below, where it's
+    # never added.
     if call["name"] == ASK_HUMAN_TOOL_NAME:
-        answer = interrupt(
-            {
-                "type": "clarification",
-                "test_id": state["test_case"].test_id,
-                "question": call["args"].get("question", ""),
-                "context": call["args"].get("context"),
-                "sensitive": bool(call["args"].get("sensitive", False)),
-            }
-        )
-        answer_text = answer.get("text", "")
+        test_id = state["test_case"].test_id
 
-        # A human can take an arbitrary amount of real time to answer — the browser
-        # session sits open the whole time, so element refs the model captured before
-        # the pause are frequently stale by the time it resumes. Confirmed directly: a
-        # resumed worker clicked a pre-pause ref, got "not found," landed on a blank
-        # page, and — rather than recovering — restarted its entire test case from step
-        # 1, burning through its turn budget on repeated work instead of progress.
-        # Embedding a fresh snapshot right here, deterministically, is both CHEAPER and
-        # more reliable than a prompt-only fix: it saves an entire extra agent_node ->
-        # tool_node round trip the model would otherwise need just to ask for one, and
-        # it doesn't depend on the model remembering to.
-        _, _, tool_map = await get_session(session_key(config, state["test_case"].test_id))
-        fresh_snapshot = _truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
-        reply = ToolMessage(
-            content=(
-                f"{answer_text}\n\n[Fresh snapshot taken after waiting for this answer — "
-                f"element refs from before this point may be stale, use these instead:]\n{fresh_snapshot}"
-            ),
-            tool_call_id=call["id"],
-            name=call["name"],
-        )
+        async def _tool_map() -> dict:
+            _, _, tm = await get_session(session_key(config, test_id))
+            return tm
+
+        reply, answer_text, sensitive = await ask_human_and_reply(call, _tool_map, subject_id=test_id)
         updates: dict = {"messages": [reply], "pending_tool_calls": remaining}
-        if call["args"].get("sensitive"):
+        if sensitive:
             updates["sensitive_answers"] = [*state.get("sensitive_answers", []), answer_text]
         return updates
 
-    # Pure check, no side effect yet — so replaying this node on resume is free even
-    # though the interrupt() call below pauses execution mid-function.
-    if _is_risky(call):
-        decision = interrupt(
-            {
-                "type": "risky_action",
-                "test_id": state["test_case"].test_id,
-                "tool": call["name"],
-                "args": call["args"],
-            }
+    decision = await review_if_risky(call, subject_id=state["test_case"].test_id)
+    if decision is not None and not decision.get("approved", False):
+        blocked = ToolMessage(
+            content=f"Blocked by human reviewer: {decision.get('reason', 'not approved')}",
+            tool_call_id=call["id"],
+            name=call["name"],
         )
-        if not decision.get("approved", False):
-            blocked = ToolMessage(
-                content=f"Blocked by human reviewer: {decision.get('reason', 'not approved')}",
-                tool_call_id=call["id"],
-                name=call["name"],
-            )
-            return {"messages": [blocked], "pending_tool_calls": remaining}
+        return {"messages": [blocked], "pending_tool_calls": remaining}
 
     # NOTE: a resume landing on a different process than the one that paused finds no
     # cached session here and transparently opens a fresh, unnavigated browser instead
@@ -402,7 +292,7 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     key = session_key(config, state["test_case"].test_id)
     _, _, tool_map = await get_session(key)
     result = await tool_map[call["name"]].ainvoke(call["args"])
-    result_text = _truncate_tool_result(str(result))
+    result_text = truncate_tool_result(str(result))
 
     # See ensure_action_overlay's docstring for why this has to be retried here rather
     # than once at session start — cheap no-op once already enabled for this session.
@@ -458,7 +348,7 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
     # the agent was created, while the real final dashboard showed "Total Agents: 0" —
     # the remembered conversation didn't match the true current state. This costs one
     # extra MCP call, not an extra LLM call, so it's effectively free.
-    final_snapshot = _truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
+    final_snapshot = truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
 
     # Found directly from a live run: a test case that spent most of its turn budget on
     # an unplanned signup detour, then hit MAX_TOOL_TURNS with the actual goal (typing
@@ -478,9 +368,9 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         else ""
     )
 
-    model = get_chat_model(ModelRole.VERDICT, temperature=0)
-    verdict: Verdict = await model.with_structured_output(Verdict).ainvoke(
-        _compact_history(state["messages"])
+    model = with_fallback(ModelRole.VERDICT, lambda m: m.with_structured_output(Verdict), temperature=0)
+    verdict: Verdict = await model.ainvoke(
+        compact_history(state["messages"])
         + [
             HumanMessage(
                 f"Here is the ACTUAL page state right now, captured fresh for this verdict — trust this over "

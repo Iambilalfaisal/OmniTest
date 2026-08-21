@@ -4,6 +4,15 @@ proactively about known ambiguities (credentials, destructive actions) — see
 graph/discovery_graph.py for why the interrupt() that pauses each turn lives in a
 SEPARATE node from this one (replay safety: this node does all the real work — crawling
 and LLM calls — and must never itself pause, or a resume would redo it).
+
+`explore_more`'s dive is likewise deliberately deferred rather than run inline: an
+earlier version crawled the requested page and re-invoked the LLM a SECOND time in the
+same turn, so the model could see it — costing a second, largely redundant call every
+time the model asked for a dive (up to MAX_EXTRA_DIVES per conversation), since the
+first call's turn was simply thrown away. `DiscoveryState.pending_dive` instead carries
+the request across the turn boundary: the crawl happens at the TOP of the NEXT
+invocation, before that turn's one LLM call, and reads more like a real conversation
+("let me look at /checkout" -> the next reply has it) than a same-turn interruption would.
 """
 from __future__ import annotations
 
@@ -14,7 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.store.base import BaseStore
 
 from ..core.discovery_state import DiscoveryState
-from ..core.llm import ModelRole, get_chat_model
+from ..core.llm import ModelRole, with_fallback
 from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, DiscoveryTurn, SiteMap
 from ..core.run_planning import ensure_expected_result, generate_run_token
@@ -81,8 +90,9 @@ def _discovery_llm():
     # Lazy for the same reason as planner._planner_llm — reuses PLANNER_MODEL rather than
     # a separate required env var, since the chat conversation IS the planner for a
     # chat-approved run; can be split into its own model later if cost/latency tuning
-    # turns out to need it.
-    return get_chat_model(ModelRole.PLANNER, temperature=0).with_structured_output(DiscoveryTurn)
+    # turns out to need it. Same PLANNER_FALLBACK_MODEL (OpenRouter) as the planner node
+    # takes over on a Gemini rate-limit/server error — see core/llm.py's with_fallback.
+    return with_fallback(ModelRole.PLANNER, lambda m: m.with_structured_output(DiscoveryTurn), temperature=0)
 
 
 def _format_candidate_plan(plan) -> str:
@@ -169,19 +179,29 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
             ),
         ]
         history = seed
+    elif state.get("pending_dive") is not None:
+        # A prior turn's explore_more is consumed HERE, at the top of the turn that
+        # follows it, instead of inline in the same turn that requested it — see this
+        # module's docstring for why doing it inline cost a second, largely redundant
+        # LLM call (up to MAX_EXTRA_DIVES times per conversation) to re-answer a turn
+        # the model had already just answered, without the new page. Deferring it one
+        # turn costs nothing: the user's next reply is the natural point to fold in what
+        # the dive found, and it reads more like a real conversation ("let me look at
+        # /checkout" -> next turn has it) than a mid-turn interruption would.
+        already_visited = {p.url for p in site_context.pages}
+        extra = await _crawl(
+            state["target_url"], store, start_url=state["pending_dive"], already_visited=already_visited
+        )
+        site_context = _merge_site_maps(site_context, extra)
 
     turn: DiscoveryTurn = await _discovery_llm().ainvoke(
         history + [_context_message(site_context, state.get("candidate_plan"))]
     )
 
+    next_pending_dive = None
     if turn.explore_more is not None and extra_dives_used < MAX_EXTRA_DIVES:
-        already_visited = {p.url for p in site_context.pages}
-        extra = await _crawl(state["target_url"], store, start_url=turn.explore_more.url, already_visited=already_visited)
-        site_context = _merge_site_maps(site_context, extra)
+        next_pending_dive = turn.explore_more.url
         extra_dives_used += 1
-        turn = await _discovery_llm().ainvoke(
-            history + [_context_message(site_context, state.get("candidate_plan"))]
-        )
 
     # See core/run_planning.py's ensure_expected_result docstring: the model can and does
     # omit this required field, and this candidate_plan is read again next turn (by
@@ -198,4 +218,5 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
         "candidate_plan": candidate_plan,
         "run_token": run_token,
         "turn_count": state.get("turn_count", 0) + 1,
+        "pending_dive": next_pending_dive,
     }

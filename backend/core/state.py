@@ -51,8 +51,8 @@ class QAState(TypedDict):
     test_results: Annotated[list[TestResult], operator.add]
     summary: dict
     plan_approved: bool
-    # Stage 3 — set once by auth_setup_node (nodes/auth_setup.py) before the worker
-    # fan-out, from a single shared login/signup; None if no test_case in this run has
+    # Stage 3 — set once by the "auth_setup_node" subgraph (nodes/auth/nodes.py) before
+    # the worker fan-out, from a single shared login/signup; None if no test_case in this run has
     # requires_auth=True, or if establishing it failed. Holds the ABSOLUTE PATH to the
     # storage-state file auth_setup_node had browser_storage_state write to (confirmed
     # against the installed @playwright/mcp: both browser_storage_state and

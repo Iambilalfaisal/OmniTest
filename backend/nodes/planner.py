@@ -11,7 +11,7 @@ from contextlib import AsyncExitStack
 
 from langgraph.store.base import BaseStore
 
-from ..core.llm import ModelRole, get_chat_model
+from ..core.llm import ModelRole, with_fallback
 from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, TestPlan
 from ..core.run_planning import ensure_expected_result, ensure_unique_test_ids, generate_run_token
@@ -72,8 +72,9 @@ answer.
 def _planner_llm():
     # get_chat_model (core/llm.py) is itself lazy — importing this module (e.g. at API
     # startup) still doesn't require GOOGLE_API_KEY until a run actually reaches the
-    # planner node. PLANNER_MODEL is required with no fallback — set it explicitly in .env.
-    return get_chat_model(ModelRole.PLANNER, temperature=0).with_structured_output(TestPlan)
+    # planner node. PLANNER_MODEL is required — set it explicitly in .env; an optional
+    # PLANNER_FALLBACK_MODEL (OpenRouter) takes over on a Gemini rate-limit/server error.
+    return with_fallback(ModelRole.PLANNER, lambda m: m.with_structured_output(TestPlan), temperature=0)
 
 
 async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dict:

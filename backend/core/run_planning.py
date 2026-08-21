@@ -25,14 +25,24 @@ def ensure_unique_test_ids(test_cases: list[TestCase]) -> list[TestCase]:
     `session_key` (nodes/worker/session.py) both key a test case's isolated browser
     session off `test_id` — a collision would silently share one session (and one
     TestResult slot) between two test cases instead of erroring.
+
+    Checks the generated candidate against every id ALREADY EMITTED, not just a per-base
+    occurrence count — a plain counter lets a generated suffix collide with an id that
+    was already in the input: ["login", "login", "login-2"] used to produce
+    ["login", "login-2", "login-2"], recreating the exact collision this function exists
+    to prevent. Incrementing the suffix until the candidate is actually free closes that.
     """
-    seen: dict[str, int] = {}
+    emitted: set[str] = set()
     result = []
     for tc in test_cases:
         base = tc.test_id or "tc"
-        seen[base] = seen.get(base, 0) + 1
-        new_id = base if seen[base] == 1 else f"{base}-{seen[base]}"
-        result.append(tc if new_id == tc.test_id else tc.model_copy(update={"test_id": new_id}))
+        candidate = base
+        suffix = 2
+        while candidate in emitted:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        emitted.add(candidate)
+        result.append(tc if candidate == tc.test_id else tc.model_copy(update={"test_id": candidate}))
     return result
 
 

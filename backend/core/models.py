@@ -291,7 +291,7 @@ class TestCase(BaseModel):
         default=False,
         description="True if this test case's goal needs an already-logged-in starting session AND is not "
         "itself testing auth (sign-up/login/logout/reset) — the run establishes one shared login once "
-        "(nodes/auth_setup.py) and restores it into this test case's browser before its first step, so "
+        "(nodes/auth/nodes.py) and restores it into this test case's browser before its first step, so "
         "`steps` must NOT include its own sign-up/login. See TEST_CASE_AUTHORING_GUIDELINES for when this "
         "is and isn't appropriate.",
     )
