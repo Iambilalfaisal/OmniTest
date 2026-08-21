@@ -76,9 +76,26 @@ class WorkerState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     pending_tool_calls: list[dict]
     turn_count: int
+    # Earned-extension budget (backend/nodes/worker/nodes.py's MAX_TOOL_TURNS_CEILING /
+    # TURN_BUDGET_BONUS): starts unset (agent_node seeds it to MAX_TOOL_TURNS on turn 1),
+    # then grows when a deviation is handled or an ask_human answer lands, capped at the
+    # ceiling. No reducer needed — like turn_count, only this one worker's own sequential
+    # nodes ever write it, and it isn't a QAState field name so a subgraph-as-node merge
+    # never has to reconcile it across parallel branches (see QAState._keep_latest's
+    # docstring for which field names DO need one and why).
+    turn_budget: int
     test_results: list[TestResult]
     sensitive_answers: list[str]  # ask_human answers marked sensitive — redacted out of
                                    # the final verdict reason before it leaves this subgraph.
+    # One relative path per mutating tool call, appended by tool_node — needs
+    # operator.add (unlike test_results, sensitive_answers) because, unlike those,
+    # MULTIPLE separate tool_node invocations each contribute their own item to this
+    # SAME list across one test case's loop, not just once at the end. See
+    # nodes/worker/evidence.py's capture_mutation_clip for why each clip covers only
+    # one action (plus a few seconds of padding) instead of one video for the whole
+    # test case — a continuous recording captures however long the LLM took to decide
+    # between actions too, which dominates a video's length and shows nothing.
+    video_clips: Annotated[list[str], operator.add]
     # Stage 3 — populated in the Send() payload (graph/builder.py's route_to_workers)
     # only when test_case.requires_auth is True; None otherwise. No reducer needed here:
     # unlike QAState's copy, nothing inside this subgraph ever rewrites it.

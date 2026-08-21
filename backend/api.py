@@ -57,7 +57,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from .core import llm_metrics
+from .core import llm_metrics, progress, run_knowledge
 from .core.discovery_state import DiscoveryState
 from .core.history import HistoryStore, make_history_store
 from .core.memory import make_store
@@ -320,6 +320,17 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
             # docstring, nothing automatically re-drives a crashed run, so the entry
             # would otherwise leak in llm_metrics._METRICS forever.
             llm_metrics.discard(thread_id)
+            # Same lifecycle/rationale as llm_metrics.discard above — a PAUSE must keep
+            # this run's shared facts/answers around for the resume (and for whichever
+            # sibling worker branches are still running), only a true end-of-run clears
+            # them; see core/run_knowledge.py's own docstring for why it's fine for this
+            # to be process-local/best-effort like llm_metrics already is.
+            run_knowledge.discard(thread_id)
+            # Same lifecycle/rationale again — the live per-test-case progress this run
+            # accumulated (core/progress.py) is only ever useful WHILE run_events' SSE
+            # loop below is still polling this thread_id; once truly finished, the same
+            # information already lives in the `done` payload's test_results.
+            progress.discard(thread_id)
 
 
 def _model_dump(value):
@@ -493,6 +504,14 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
                         {
                             "test_cases": [_model_dump(tc) for tc in snapshot.values.get("test_cases", [])],
                             "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
+                            # core/progress.py: per-test-case live detail (phase, step
+                            # index, current action, turn/budget, deviation/ask counts)
+                            # for whichever test cases are still queued/running/awaiting
+                            # input/grading — a case already in test_results above has
+                            # nothing more this adds, but is left in rather than filtered
+                            # out, since it's harmless and one less special case for the
+                            # frontend to handle right at the queued->done transition.
+                            "worker_progress": progress.snapshot(run_id),
                         }
                     ),
                 }

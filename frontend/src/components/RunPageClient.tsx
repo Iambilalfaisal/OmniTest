@@ -2,7 +2,14 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import WorkerCard, { CATEGORY_LABELS, CATEGORY_STYLES, TestCase, TestCategory, TestResult } from "@/components/WorkerCard";
+import WorkerCard, {
+  CATEGORY_LABELS,
+  CATEGORY_STYLES,
+  TestCase,
+  TestCategory,
+  TestResult,
+  WorkerProgress,
+} from "@/components/WorkerCard";
 import HumanReviewPanel, { PendingInterrupt, ResumeDecision } from "@/components/HumanReviewPanel";
 import TraceViewer from "@/components/TraceViewer";
 
@@ -13,7 +20,8 @@ type RunSummary = {
   total: number;
   passed: number;
   failed: number;
-  by_category?: Record<TestCategory, { total: number; passed: number; failed: number }>;
+  blocked?: number;
+  by_category?: Record<TestCategory, { total: number; passed: number; failed: number; blocked?: number }>;
 };
 
 function formatElapsed(totalSeconds: number): string {
@@ -26,6 +34,9 @@ export default function RunPageClient() {
   const runId = useSearchParams().get("id");
   const [plan, setPlan] = useState<TestCase[]>([]);
   const [results, setResults] = useState<Record<string, TestResult>>({});
+  // Live, step-level detail for whichever test cases don't have a `results` entry yet
+  // (backend/core/progress.py, via the SSE `progress` event's `worker_progress` map).
+  const [workerProgress, setWorkerProgress] = useState<Record<string, WorkerProgress>>({});
   const [summary, setSummary] = useState<RunSummary | null>(null);
   const [done, setDone] = useState(false);
   const [status, setStatus] = useState("Planning tests…");
@@ -34,9 +45,9 @@ export default function RunPageClient() {
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [activeTrace, setActiveTrace] = useState<string | null>(null);
 
-  // Proof-of-life for the "hidden until done" view below: the backend's SSE stream
-  // sends a heartbeat "progress" event roughly every second regardless of whether
-  // anything actually changed (see backend/api.py's run_events), so a live pulse tied
+  // Proof-of-life for the connection itself: the backend's SSE stream sends a
+  // heartbeat "progress" event roughly every second regardless of whether anything
+  // actually changed (see backend/api.py's run_events), so a live pulse tied
   // to `lastEventAt` — not just a local timer — genuinely reflects the stream working,
   // not a fake animation.
   const [connected, setConnected] = useState(true);
@@ -87,6 +98,12 @@ export default function RunPageClient() {
             }
             return next;
           });
+        }
+        // Replaced wholesale, not merged — backend/core/progress.py's snapshot is
+        // already the full current set for this run_id every tick, and a test case
+        // that finished (now covered by `results` above) simply stops appearing in it.
+        if (payload.worker_progress) {
+          setWorkerProgress(payload.worker_progress as Record<string, WorkerProgress>);
         }
       });
 
@@ -167,7 +184,8 @@ export default function RunPageClient() {
     const completed = Object.keys(results).length;
     const passed = Object.values(results).filter((result) => result.status === "Pass").length;
     const failed = Object.values(results).filter((result) => result.status === "Fail").length;
-    return { total, completed, passed, failed };
+    const blocked = Object.values(results).filter((result) => result.status === "Blocked").length;
+    return { total, completed, passed, failed, blocked };
   }, [plan, results]);
 
   const awaitingApprovalTestIds = useMemo(
@@ -227,7 +245,7 @@ export default function RunPageClient() {
         </div>
 
         {done ? (
-          <div className="mt-6 grid gap-4 sm:grid-cols-3">
+          <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
               <div className="text-xs uppercase tracking-[0.28em] text-slate-400">Tests</div>
               <div className="mt-3 text-2xl font-semibold text-white">{stats.total}</div>
@@ -239,6 +257,10 @@ export default function RunPageClient() {
             <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-4">
               <div className="text-xs uppercase tracking-[0.28em] text-rose-300/80">Failed</div>
               <div className="mt-3 text-2xl font-semibold text-rose-300">{stats.failed}</div>
+            </div>
+            <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
+              <div className="text-xs uppercase tracking-[0.28em] text-amber-300/80">Blocked</div>
+              <div className="mt-3 text-2xl font-semibold text-amber-300">{stats.blocked}</div>
             </div>
           </div>
         ) : (
@@ -280,6 +302,9 @@ export default function RunPageClient() {
                 <div className="mt-2 text-sm text-slate-300">
                   {counts.passed}/{counts.total} passed
                   {counts.failed > 0 && <span className="text-rose-300"> · {counts.failed} failed</span>}
+                  {!!counts.blocked && counts.blocked > 0 && (
+                    <span className="text-amber-300"> · {counts.blocked} blocked</span>
+                  )}
                 </div>
               </div>
             ))}
@@ -296,13 +321,17 @@ export default function RunPageClient() {
         />
       )}
 
-      {done ? (
+      {plan.length > 0 ? (
+        // Rendered as soon as the plan exists, not only once every test case is
+        // done — each card shows live step-by-step progress via `workerProgress`
+        // until its own `results` entry lands, then switches to the final verdict.
         <section className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
           {plan.map((testCase) => (
             <WorkerCard
               key={testCase.test_id}
               testCase={testCase}
               result={results[testCase.test_id]}
+              progress={workerProgress[testCase.test_id]}
               awaitingApproval={awaitingApprovalTestIds.has(testCase.test_id)}
               apiBase={API_BASE}
               onViewTrace={setActiveTrace}
@@ -314,7 +343,7 @@ export default function RunPageClient() {
           <div className="glass-panel rounded-3xl p-8 text-center text-slate-300">
             <div className="flex items-center justify-center gap-2">
               <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-              {plan.length === 0 ? "Planning your QA workflow…" : "Running your tests — results will appear here when they're done."}
+              Planning your QA workflow…
             </div>
             <p className="mt-2 text-xs text-slate-500">
               Still working — {formatElapsed(Math.floor((now - startedAtRef.current) / 1000))} elapsed.

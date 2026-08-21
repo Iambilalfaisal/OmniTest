@@ -75,6 +75,52 @@ ask_human_tool = StructuredTool.from_function(
 # step should need.
 EXCLUDED_TOOL_NAMES = frozenset({"browser_run_code_unsafe"})
 
+# Shared between WORKER_SYSTEM_PROMPT (nodes/worker/nodes.py) and AUTH_SETUP_SYSTEM_PROMPT
+# (nodes/auth/nodes.py) so both browser-driving loops agree on when to route around a
+# real-world surprise silently versus stop and ask. Found directly from a live run: a
+# worker told to "stop and report" on ANY step that didn't match reality byte-for-byte
+# (an unplanned onboarding screen, an extra required field, a cookie banner) was graded
+# Fail on straightforward happy-path cases purely because the written plan and the real
+# page weren't identical — never because the site itself misbehaved. Joined into each
+# prompt with plain `+` concatenation, not an f-string: WORKER_SYSTEM_PROMPT embeds a
+# literal JSON example (`browser_fill_form({"fields": [...`) whose braces an f-string
+# would otherwise require escaping.
+DEVIATION_POLICY = """## Handling a real page that does not match your steps
+
+Your steps describe the INTENDED path. The real site will sometimes show something they
+didn't anticipate. When that happens, decide which of these buckets it's in.
+
+### Handle it yourself, then keep going — and say what you changed in your final report
+- A cookie/consent banner, or any interstitial/popup blocking the page.
+- An onboarding wizard, product tour, or "what's your role" gate before the real page.
+- A newsletter, app-install, or notification-permission modal.
+- A control whose visible label differs from the step's wording but is unambiguously the
+  one the step means (e.g. the step says "Sign up" and the button reads "Create account").
+- One extra required field your steps don't mention, where an obviously-safe value is
+  clear from context — invent one rather than leaving it empty.
+- An extra "Are you sure?" confirmation on an action your steps already told you to take.
+- A tool call that failed once, or a page that looks broken/blank right after navigating —
+  take a fresh `browser_snapshot` and try once more before treating it as a real problem.
+- Needing to scroll or paginate to bring an element your step already names into view.
+
+### Stop and call `ask_human` instead — never guess these
+- A password, code, or any other secret you were not given.
+- An OTP prompt, a CAPTCHA, two-factor auth, an email/SMS verification step, or a paywall.
+- A choice with a real business consequence (which plan, which payment method) that your
+  steps don't specify.
+- Two or more visible controls that could each plausibly be the one a step means.
+- An extra required field where guessing wrong would invalidate what this case is
+  checking (a phone number, a coupon code, a tax ID) rather than just being cosmetic.
+
+### Never allowed, no matter which bucket you think this is
+- Changing a value your steps gave you literally, in quotes.
+- Substituting a different control for the one a step names, unless it is unambiguously
+  the same control under a different label (see above).
+- Skipping the exact step that IS the behavior this test case exists to check.
+- Making a deliberately-invalid input valid just so the site accepts it, when the
+  rejection itself was the outcome you were checking for.
+"""
+
 # Backstop cap on any single tool result's size before it enters message history —
 # without this, a large tool result (most commonly browser_snapshot's accessibility
 # tree on a complex page) gets resent in full on every subsequent turn of this same

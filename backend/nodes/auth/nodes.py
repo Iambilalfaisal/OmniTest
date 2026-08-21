@@ -37,6 +37,7 @@ from langgraph.graph import END, START, StateGraph
 from ...core.llm import LLM_RETRY_POLICY, ModelRole, with_fallback
 from ..agent_loop import (
     ASK_HUMAN_TOOL_NAME,
+    DEVIATION_POLICY,
     EXCLUDED_TOOL_NAMES,
     ask_human_and_reply,
     ask_human_tool,
@@ -89,6 +90,10 @@ were given (e.g. email "qa+<run_token>@example.com", with a strong password like
 not click anything else, do not sign out, do not change any account setting, and do not \
 delete anything.
 
+The recipe above is the intended path; the real sign-up/log-in flow may show something it \
+didn't anticipate (an onboarding step, an extra field, a renamed button). The same policy a \
+test case's own worker follows applies to you too:
+""" + DEVIATION_POLICY + """
 If you get blocked by something you cannot finish on your own — an email or SMS verification \
 code, a CAPTCHA, two-factor auth, or a required payment — call the `ask_human` tool and say \
 exactly what blocked you and what you need (e.g. the code that was emailed). Do not retry, do \
@@ -217,11 +222,13 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
         run_dir = run_dir_for(key)
         run_dir.mkdir(parents=True, exist_ok=True)
         # Finalizes what get_session's cache-miss path auto-started for this session
-        # (start_capture, nodes/worker/session.py) — a test case's own tool_node loop
-        # has no equivalent running, so verdict_node is the only other place this
-        # pairing (start on open, stop before close) already happens.
+        # (start_capture, nodes/worker/session.py). No video counterpart: video is no
+        # longer session-length for anything in this codebase (nodes/worker/evidence.py's
+        # capture_mutation_clip records one short clip per mutating action instead,
+        # inline in tool_node as it happens) — auth_tool_node doesn't do that, matching
+        # the original nodes/auth_setup.py's behavior of capturing no evidence at all
+        # for the shared-login setup, which is never shown as a graded test result.
         await stop_and_capture(tool_map, "browser_stop_tracing", run_dir / "trace.zip")
-        await stop_and_capture(tool_map, "browser_stop_video", run_dir / "video.webm")
 
         storage_state_tool = tool_map.get("browser_storage_state")
         if storage_state_tool is None:

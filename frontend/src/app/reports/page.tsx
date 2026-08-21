@@ -2,17 +2,24 @@
 
 import { FormEvent, useState } from "react";
 import TraceViewer from "@/components/TraceViewer";
-import { CATEGORY_LABELS, CATEGORY_STYLES, TestCategory } from "@/components/WorkerCard";
+import { CATEGORY_LABELS, CATEGORY_STYLES, ClipSequencePlayer, TestCategory } from "@/components/WorkerCard";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 type TestResult = {
   test_id: string;
+  // "Pass" | "Fail" | "Blocked" (backend/nodes/worker/nodes.py's Verdict).
   status: string;
   screenshot_path: string;
   trace_path?: string | null;
-  video_path?: string | null;
+  // One short clip per mutating action, not one video for the whole test case — see
+  // backend/nodes/worker/evidence.py's capture_mutation_clip.
+  video_clips?: string[];
   reason: string;
+  // What the adaptive worker had to work around, and the steps as actually executed
+  // when they diverged from the written plan (backend/core/models.py's TestResult).
+  deviations?: string[];
+  amended_steps?: string[];
 };
 
 type RunReport = {
@@ -20,7 +27,8 @@ type RunReport = {
     total: number;
     passed: number;
     failed: number;
-    by_category?: Record<TestCategory, { total: number; passed: number; failed: number }>;
+    blocked?: number;
+    by_category?: Record<TestCategory, { total: number; passed: number; failed: number; blocked?: number }>;
   };
   test_results: TestResult[];
   plan_approved: boolean;
@@ -76,7 +84,7 @@ export default function ReportsPage() {
 
       {report && (
         <>
-          <section className="grid gap-4 md:grid-cols-3">
+          <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-5">
               <div className="text-xs uppercase tracking-[0.28em] text-slate-400">Total</div>
               <div className="mt-3 text-3xl font-semibold text-white">{report.summary.total}</div>
@@ -88,6 +96,10 @@ export default function ReportsPage() {
             <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-5">
               <div className="text-xs uppercase tracking-[0.28em] text-rose-300/80">Failed</div>
               <div className="mt-3 text-3xl font-semibold text-rose-300">{report.summary.failed}</div>
+            </div>
+            <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-5">
+              <div className="text-xs uppercase tracking-[0.28em] text-amber-300/80">Blocked</div>
+              <div className="mt-3 text-3xl font-semibold text-amber-300">{report.summary.blocked ?? 0}</div>
             </div>
           </section>
 
@@ -107,6 +119,9 @@ export default function ReportsPage() {
                     <div className="mt-2 text-sm text-slate-300">
                       {counts.passed}/{counts.total} passed
                       {counts.failed > 0 && <span className="text-rose-300"> · {counts.failed} failed</span>}
+                      {!!counts.blocked && counts.blocked > 0 && (
+                        <span className="text-amber-300"> · {counts.blocked} blocked</span>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -146,6 +161,25 @@ export default function ReportsPage() {
 
                   <p className="mt-3 text-sm leading-6 text-slate-300">{result.reason}</p>
 
+                  {(result.deviations?.length || result.amended_steps?.length) ? (
+                    <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3">
+                      <div className="text-[10px] uppercase tracking-[0.25em] text-amber-300/80">Plan amendments</div>
+                      {result.deviations && result.deviations.length > 0 && (
+                        <ul className="mt-2 space-y-1 text-xs leading-5 text-slate-300">
+                          {result.deviations.map((deviation, i) => (
+                            <li key={i}>• {deviation}</li>
+                          ))}
+                        </ul>
+                      )}
+                      {result.amended_steps && result.amended_steps.length > 0 && (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          <span className="font-semibold text-slate-300">Executed as: </span>
+                          {result.amended_steps.join(" → ")}
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
+
                   {result.screenshot_path && (
                     <a
                       href={`${API_BASE}/${result.screenshot_path}`}
@@ -162,13 +196,8 @@ export default function ReportsPage() {
                     </a>
                   )}
 
-                  {result.video_path && (
-                    <video
-                      src={`${API_BASE}/${result.video_path}`}
-                      controls
-                      preload="metadata"
-                      className="mt-3 w-full rounded-xl border border-white/10 bg-black"
-                    />
+                  {result.video_clips && result.video_clips.length > 0 && (
+                    <ClipSequencePlayer clips={result.video_clips} apiBase={API_BASE} className="mt-3" />
                   )}
                 </div>
               ))}

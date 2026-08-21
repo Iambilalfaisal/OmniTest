@@ -174,6 +174,7 @@ class HistoryStore:
                         date_trunc('day', updated_at) AS day,
                         COALESCE(SUM((summary->>'passed')::int), 0) AS passed,
                         COALESCE(SUM((summary->>'failed')::int), 0) AS failed,
+                        COALESCE(SUM((summary->>'blocked')::int), 0) AS blocked,
                         COUNT(*) AS runs_completed
                     FROM history_sessions
                     WHERE {' AND '.join(trend_where)}
@@ -189,6 +190,7 @@ class HistoryStore:
                 "date": row["day"].date().isoformat(),
                 "passed": row["passed"],
                 "failed": row["failed"],
+                "blocked": row["blocked"],
                 "runs_completed": row["runs_completed"],
             }
             for row in trend_rows

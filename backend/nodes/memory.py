@@ -33,10 +33,24 @@ async def memory_node(state: QAState, *, store: BaseStore | None = None) -> dict
             # reads the same either way and gets persisted as a bogus "site quirk". getattr,
             # not direct access: this best-effort node must never raise on a test_case from
             # a checkpoint predating ensure_expected_result (core/run_planning.py).
+            #
+            # deviations/amended_steps (TestResult, populated from the adaptive worker's
+            # Verdict — nodes/worker/nodes.py) are what let a recorded site_quirk feed
+            # the NEXT run's planner_node (core/memory.py's retrieve_memory_context is
+            # already injected into PLANNER_PROMPT) with something concrete enough to
+            # write straight into that flow's steps — "this signup form also asks for a
+            # Company name" — instead of the next run's worker hitting, and adapting to,
+            # the exact same surprise from scratch. getattr here too, same reason as
+            # expected_result above: a TestResult from a checkpoint predating these
+            # fields has no value for them.
+            deviations = getattr(result, "deviations", None) or []
+            amended_steps = getattr(result, "amended_steps", None) or []
             transcript_lines.append(
                 f"Goal: {test_case.goal}\nCategory: {test_case.category}\n"
                 f"Expected: {getattr(test_case, 'expected_result', None) or '(not specified)'}\n"
                 f"Status: {result.status}\nReason: {result.reason}\n"
+                f"Deviations from the written steps: {'; '.join(deviations) if deviations else '(none)'}\n"
+                f"Steps as actually executed: {'; '.join(amended_steps) if amended_steps else '(matched the written steps)'}\n"
             )
         transcript = "\n".join(transcript_lines)
 

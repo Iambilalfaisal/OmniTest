@@ -12,13 +12,15 @@ from ..core.state import QAState
 async def reporter_node(state: QAState, config: RunnableConfig) -> dict:
     results_by_id = {r.test_id: r for r in state["test_results"]}
     by_category: dict[str, dict[str, int]] = {}
-    passed = failed = 0
+    passed = failed = blocked = 0
 
     for test_case in state["test_cases"]:
         result = results_by_id.get(test_case.test_id)
         if result is None:
             continue  # e.g. filtered out at plan-review time
-        bucket = by_category.setdefault(test_case.category, {"total": 0, "passed": 0, "failed": 0})
+        bucket = by_category.setdefault(
+            test_case.category, {"total": 0, "passed": 0, "failed": 0, "blocked": 0}
+        )
         bucket["total"] += 1
         if result.status == "Pass":
             passed += 1
@@ -26,6 +28,12 @@ async def reporter_node(state: QAState, config: RunnableConfig) -> dict:
         elif result.status == "Fail":
             failed += 1
             bucket["failed"] += 1
+        # 'Blocked' (nodes/worker/nodes.py's Verdict) — a named external wall or an
+        # exhausted extended budget, kept out of `failed` since it isn't evidence the
+        # site itself misbehaved.
+        elif result.status == "Blocked":
+            blocked += 1
+            bucket["blocked"] += 1
 
     # Folded in here (not read separately by api.py) so it rides along with the rest of
     # `summary` through the existing JSONB history column and SSE `done` payload with no
@@ -38,6 +46,7 @@ async def reporter_node(state: QAState, config: RunnableConfig) -> dict:
             "total": len(results_by_id),
             "passed": passed,
             "failed": failed,
+            "blocked": blocked,
             "by_category": by_category,
             "llm": llm_metrics.snapshot(thread_id),
         }

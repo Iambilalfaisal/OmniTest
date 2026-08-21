@@ -2,9 +2,11 @@
 Send-based fan-out over worker_node -> reporter_node -> memory_node."""
 from __future__ import annotations
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
+from ..core import progress
 from ..core.llm import LLM_RETRY_POLICY
 from ..core.models import TestCase
 from ..core.state import QAState
@@ -36,7 +38,7 @@ def route_after_plan_review(state: QAState) -> str:
     return "auth_setup_node" if state["plan_approved"] else "reporter_node"
 
 
-def route_to_workers(state: QAState):
+def route_to_workers(state: QAState, config: RunnableConfig):
     """auth_setup_node's outgoing edge — by construction (see route_entry and
     route_after_plan_review) this is only ever reached with plan_approved already True,
     so unlike the pre-Stage-3 version of this function there's no unapproved-plan branch
@@ -44,19 +46,32 @@ def route_to_workers(state: QAState):
     only threaded into a given worker's payload when that test case actually declared
     requires_auth — a case that didn't ask for a shared login shouldn't have one silently
     injected into its browser.
+
+    Also pre-registers every test case in core/progress.py as `queued`, before any
+    worker_node branch has actually started — this is the one point in the whole graph
+    where every TestCase in the approved plan is visited together with the run's
+    thread_id, so it's the only place that can seed the FULL set up front. Without this,
+    the SSE `progress` payload (api.py) would only ever show a test case once its own
+    agent_node's first turn happens to land, so a card that hasn't been scheduled onto a
+    free MAX_CONCURRENT_WORKERS slot yet would be indistinguishable from one that
+    doesn't exist.
     """
+    run_id = config["configurable"]["thread_id"]
     auth_state = state.get("auth_storage_state")
-    return [
-        Send(
-            "worker_node",
-            {
-                "target_url": state["target_url"],
-                "test_case": test,
-                "auth_storage_state": auth_state if test.requires_auth else None,
-            },
+    sends = []
+    for test in state["test_cases"]:
+        progress.register(run_id, test.test_id, total_steps=len(test.steps))
+        sends.append(
+            Send(
+                "worker_node",
+                {
+                    "target_url": state["target_url"],
+                    "test_case": test,
+                    "auth_storage_state": auth_state if test.requires_auth else None,
+                },
+            )
         )
-        for test in state["test_cases"]
-    ]
+    return sends
 
 
 def route_entry(state: QAState):

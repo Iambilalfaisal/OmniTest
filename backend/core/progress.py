@@ -1,0 +1,89 @@
+"""Per-run, per-test-case LIVE progress registry — feeds backend/api.py's SSE
+`progress` event with step-level detail so the frontend can render a test case's card
+while it is still running, not only once its `verdict_node` returns. Written from
+inside nodes/worker/nodes.py's agent_node/tool_node/verdict_node (and graph/builder.py's
+route_to_workers, to pre-register every case as `queued` before any of them starts).
+
+Same design precedent as core/llm_metrics.py and core/run_knowledge.py: a module-level
+dict keyed by run_id (== LangGraph's `thread_id`), single-process/single-event-loop
+(confirmed there — see those modules' own docstrings), so no new QAState channel/
+reducer is needed. Every write here is a last-write-wins upsert, never an append, which
+is what makes a LangGraph node replay (a retried node, or a resume re-entering a node
+whose earlier attempt already wrote here) harmless — it just overwrites the same keys
+with this attempt's values instead of double-counting anything, EXCEPT `step_index`,
+which is deliberately kept as a monotonic high-water mark (see `update`) since a later
+turn's parsed step is sometimes lower than an earlier one's (the model re-mentions a step
+it already passed) and a progress bar visibly rewinding reads as broken.
+
+Honest limits: process-local and best-effort, matching every other module in this
+family — a resume landing on a different process starts this run's progress back at
+nothing; api.py's SSE loop simply shows no `worker_progress` entry for a case until that
+new process's route_to_workers (or its first node write) registers one, never a stale
+or wrong entry.
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Literal
+
+Phase = Literal["queued", "running", "awaiting_input", "grading", "done"]
+
+_PROGRESS: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _default_entry() -> dict[str, Any]:
+    return {
+        "phase": "queued",
+        "step_index": 0,
+        "total_steps": 0,
+        "current_action": None,
+        "turn": 0,
+        "budget": None,
+        "deviations": 0,
+        "asks": 0,
+    }
+
+
+def register(run_id: str, test_id: str, *, total_steps: int) -> None:
+    """Pre-registers `test_id` as `queued`, before its worker branch has actually
+    started — called once per Send payload from graph/builder.py's route_to_workers, so
+    every test case's card can render immediately on plan approval instead of only once
+    its own agent_node first runs.
+    """
+    entry = _default_entry()
+    entry["total_steps"] = total_steps
+    entry["updated_at"] = time.time()
+    _PROGRESS.setdefault(run_id, {})[test_id] = entry
+
+
+def update(run_id: str, test_id: str, **fields: Any) -> None:
+    """Last-write-wins partial update. `step_index`, if present in `fields`, is
+    clamped to never go backwards (see this module's docstring) — every other field is
+    a plain overwrite, since each represents "whatever this node's latest state is",
+    not something that accumulates.
+    """
+    bucket = _PROGRESS.setdefault(run_id, {})
+    entry = bucket.setdefault(test_id, _default_entry())
+    if "step_index" in fields:
+        fields["step_index"] = max(entry.get("step_index", 0), fields["step_index"])
+    entry.update(fields)
+    entry["updated_at"] = time.time()
+
+
+def bump(run_id: str, test_id: str, field: str, *, by: int = 1) -> None:
+    """Increments a counter field (`deviations`, `asks`) rather than overwriting it —
+    separate from `update` since these accumulate across many tool_node/agent_node
+    calls for the SAME test case, unlike every other field this module tracks.
+    """
+    bucket = _PROGRESS.setdefault(run_id, {})
+    entry = bucket.setdefault(test_id, _default_entry())
+    entry[field] = entry.get(field, 0) + by
+    entry["updated_at"] = time.time()
+
+
+def snapshot(run_id: str) -> dict[str, dict[str, Any]]:
+    return _PROGRESS.get(run_id, {})
+
+
+def discard(run_id: str) -> None:
+    _PROGRESS.pop(run_id, None)

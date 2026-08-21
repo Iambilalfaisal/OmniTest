@@ -21,7 +21,7 @@ type HistorySession = {
   target_url: string;
   label: string;
   status: SessionStatus;
-  summary?: { total: number; passed: number; failed: number } | null;
+  summary?: { total: number; passed: number; failed: number; blocked?: number } | null;
   parent_id?: string | null;
   created_at: string;
   updated_at: string;
@@ -296,6 +296,9 @@ export default function HistoryDashboard() {
                     <span>
                       {item.summary.passed}/{item.summary.total} passed
                       {item.summary.failed > 0 && <span className="text-rose-300"> · {item.summary.failed} failed</span>}
+                      {!!item.summary.blocked && item.summary.blocked > 0 && (
+                        <span className="text-amber-300"> · {item.summary.blocked} blocked</span>
+                      )}
                     </span>
                   )}
                   <span

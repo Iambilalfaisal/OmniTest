@@ -338,11 +338,32 @@ class TestPlan(BaseModel):
 
 class TestResult(BaseModel):
     test_id: str
-    status: str = Field(description="Strictly 'Pass' or 'Fail'")
+    # 'Blocked' (added alongside the adaptive worker — see nodes/agent_loop.py's
+    # DEVIATION_POLICY and nodes/worker/nodes.py's Verdict) means the run couldn't reach
+    # a verdict because of a named external wall (CAPTCHA, OTP, paywall, missing
+    # credential) or ran out of its extended turn budget while genuinely still adapting
+    # — NOT evidence the site itself is broken, so it's kept distinct from Fail.
+    status: str = Field(description="Strictly 'Pass', 'Fail', or 'Blocked'")
     screenshot_path: str
     trace_path: str | None
-    video_path: str | None
+    # One short clip per mutating action (browser_click, browser_type, ...), each
+    # padded a few seconds before/after — NOT one video for the whole test case.
+    # A continuous recording is dominated by however long the LLM took to decide
+    # between actions, which shows nothing; see nodes/worker/evidence.py's
+    # capture_mutation_clip. Empty list, never None, when nothing was captured (no
+    # mutating action ran, or devtools capability unavailable) — always passed
+    # explicitly by verdict_node, same convention as this model's other fields.
+    video_clips: list[str]
     reason: str
+    # Populated from Verdict's same-named fields (nodes/worker/nodes.py) — what the
+    # worker had to work around this run, and the steps as actually executed when they
+    # diverged from the written plan. default_factory (not required): a checkpoint
+    # written before these fields existed carries no value for them, and unlike
+    # expected_result (see its own comment above), an empty deviation list is a
+    # perfectly valid, common outcome — not a sign something was skipped.
+    deviations: list[str] = Field(default_factory=list)
+    amended_steps: list[str] = Field(default_factory=list)
+    last_step_reached: int = Field(default=0)
 
 
 class SiteMemory(BaseModel):
