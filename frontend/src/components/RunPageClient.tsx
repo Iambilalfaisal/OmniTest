@@ -5,6 +5,9 @@ import { useSearchParams } from "next/navigation";
 import WorkerCard, {
   CATEGORY_LABELS,
   CATEGORY_STYLES,
+  Feature,
+  FEATURE_PHASE_LABELS,
+  FeatureProgress,
   TestCase,
   TestCategory,
   TestResult,
@@ -16,12 +19,18 @@ import TraceViewer from "@/components/TraceViewer";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 const RECONNECT_DELAY_MS = 2000;
 
+type FeatureCounts = { total: number; passed: number; failed: number; blocked?: number };
+
 type RunSummary = {
   total: number;
   passed: number;
   failed: number;
   blocked?: number;
   by_category?: Record<TestCategory, { total: number; passed: number; failed: number; blocked?: number }>;
+  // Feature -> Flow -> Scenario rollup (backend/nodes/reporter.py) — only present once
+  // `done` fires; the live per-Feature "exploring" status while recon still runs comes
+  // from `featureProgress` below instead, since this rollup only exists after grading.
+  by_feature?: Record<string, FeatureCounts & { name: string; description: string }>;
 };
 
 function formatElapsed(totalSeconds: number): string {
@@ -37,6 +46,11 @@ export default function RunPageClient() {
   // Live, step-level detail for whichever test cases don't have a `results` entry yet
   // (backend/core/progress.py, via the SSE `progress` event's `worker_progress` map).
   const [workerProgress, setWorkerProgress] = useState<Record<string, WorkerProgress>>({});
+  // Feature -> Flow -> Scenario hierarchy (backend/core/models.py's Feature, streamed
+  // via both `progress` and `done`) and live per-Feature recon status (backend/core/
+  // progress.py's feature_snapshot, `progress` only — cleared once a run finishes).
+  const [features, setFeatures] = useState<Feature[]>([]);
+  const [featureProgress, setFeatureProgress] = useState<Record<string, FeatureProgress>>({});
   const [summary, setSummary] = useState<RunSummary | null>(null);
   const [done, setDone] = useState(false);
   const [status, setStatus] = useState("Planning tests…");
@@ -105,6 +119,14 @@ export default function RunPageClient() {
         if (payload.worker_progress) {
           setWorkerProgress(payload.worker_progress as Record<string, WorkerProgress>);
         }
+        if (payload.features?.length) {
+          setFeatures(payload.features as Feature[]);
+        }
+        // Same "replaced wholesale" reasoning as worker_progress above — this is
+        // backend/core/progress.py's feature_snapshot, already the full current set.
+        if (payload.feature_progress) {
+          setFeatureProgress(payload.feature_progress as Record<string, FeatureProgress>);
+        }
       });
 
       source.addEventListener("paused", (event) => {
@@ -129,6 +151,9 @@ export default function RunPageClient() {
           return next;
         });
         setSummary((payload.summary as RunSummary) ?? null);
+        if (payload.features?.length) {
+          setFeatures(payload.features as Feature[]);
+        }
         doneRef.current = true;
         setDone(true);
         setStatus("Completed");
@@ -200,6 +225,25 @@ export default function RunPageClient() {
       ),
     [pendingInterrupts]
   );
+
+  // Only groups by Feature once more than one Feature actually exists — a plan from
+  // before this hierarchy existed, or a single-feature run, renders the exact same flat
+  // grid as always rather than adding a header for the sake of it. Cases whose
+  // feature_id doesn't match any known Feature (a legacy checkpoint, or a stale id)
+  // fall into an "Other test cases" group rather than being silently dropped.
+  const groupedPlan = useMemo(() => {
+    if (features.length <= 1) return null;
+    const knownIds = new Set(features.map((f) => f.feature_id));
+    const groups = features.map((feature) => ({
+      feature,
+      testCases: plan.filter((tc) => tc.feature_id === feature.feature_id),
+    }));
+    const ungrouped = plan.filter((tc) => {
+      const fid = tc.feature_id;
+      return !fid || !knownIds.has(fid);
+    });
+    return { groups, ungrouped };
+  }, [features, plan]);
 
   if (!runId) {
     return (
@@ -321,7 +365,80 @@ export default function RunPageClient() {
         />
       )}
 
-      {plan.length > 0 ? (
+      {groupedPlan ? (
+        // Two-level grouping (Feature -> Scenario): a Feature header can render before
+        // it has any scenarios at all — while recon is still exploring it, featureProgress
+        // shows "Analyzing application…" here instead of an empty card grid.
+        <div className="flex flex-col gap-6">
+          {groupedPlan.groups.map(({ feature, testCases }) => {
+            const fProgress = featureProgress[feature.feature_id];
+            const fSummary = summary?.by_feature?.[feature.feature_id];
+            return (
+              <section key={feature.feature_id} className="flex flex-col gap-4">
+                <div className="glass-panel rounded-2xl p-4 md:p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-semibold text-white">{feature.name}</h2>
+                      {feature.description && (
+                        <p className="mt-1 text-xs text-slate-400">{feature.description}</p>
+                      )}
+                    </div>
+                    {fProgress?.phase === "exploring" ? (
+                      <span className="flex items-center gap-1.5 rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1 text-xs font-medium text-fuchsia-300">
+                        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-fuchsia-400" />
+                        {FEATURE_PHASE_LABELS.exploring}
+                      </span>
+                    ) : (
+                      fSummary && (
+                        <span className="text-sm text-slate-300">
+                          {fSummary.passed}/{fSummary.total} passed
+                          {fSummary.failed > 0 && <span className="text-rose-300"> · {fSummary.failed} failed</span>}
+                          {!!fSummary.blocked && fSummary.blocked > 0 && (
+                            <span className="text-amber-300"> · {fSummary.blocked} blocked</span>
+                          )}
+                        </span>
+                      )
+                    )}
+                  </div>
+                </div>
+                {testCases.length > 0 && (
+                  <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+                    {testCases.map((testCase) => (
+                      <WorkerCard
+                        key={testCase.test_id}
+                        testCase={testCase}
+                        result={results[testCase.test_id]}
+                        progress={workerProgress[testCase.test_id]}
+                        awaitingApproval={awaitingApprovalTestIds.has(testCase.test_id)}
+                        apiBase={API_BASE}
+                        onViewTrace={setActiveTrace}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+            );
+          })}
+          {groupedPlan.ungrouped.length > 0 && (
+            <section className="flex flex-col gap-4">
+              <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">Other test cases</h2>
+              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+                {groupedPlan.ungrouped.map((testCase) => (
+                  <WorkerCard
+                    key={testCase.test_id}
+                    testCase={testCase}
+                    result={results[testCase.test_id]}
+                    progress={workerProgress[testCase.test_id]}
+                    awaitingApproval={awaitingApprovalTestIds.has(testCase.test_id)}
+                    apiBase={API_BASE}
+                    onViewTrace={setActiveTrace}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+        </div>
+      ) : plan.length > 0 ? (
         // Rendered as soon as the plan exists, not only once every test case is
         // done — each card shows live step-by-step progress via `workerProgress`
         // until its own `results` entry lands, then switches to the final verdict.

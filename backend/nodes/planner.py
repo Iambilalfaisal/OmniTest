@@ -14,7 +14,7 @@ from langgraph.store.base import BaseStore
 from ..core.llm import ModelRole, with_fallback
 from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, TestPlan
-from ..core.run_planning import ensure_expected_result, ensure_unique_test_ids, generate_run_token
+from ..core.run_planning import ensure_expected_result, ensure_features, ensure_unique_test_ids, generate_run_token
 from ..core.state import QAState
 from ..mcp.client import get_accessibility_snapshot, open_playwright_session
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -62,9 +62,11 @@ this page; use these exact labels in your steps:
 
 # Now write the plan
 
-Cover the instruction above, choosing the flows from the coverage checklist that this site
-actually has and that the instruction is actually about. Give every test case a concrete,
-observable expected_result, and run the section 7 self-check over each one before you
+First name the small number of features (see section 3's feature_id bullet) this
+instruction covers, then cover the instruction above, choosing the flows from the
+coverage checklist that this site actually has and that the instruction is actually
+about. Give every test case a concrete, observable expected_result and a feature_id
+from your own features list, and run the section 7 self-check over each one before you
 answer.
 """
 
@@ -115,4 +117,8 @@ async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dic
     # a case missing it must be backfilled here — before it reaches plan_review's
     # model_dump(), the worker, or verdict_node — rather than trusted as always present.
     test_cases = ensure_expected_result(ensure_unique_test_ids(plan.test_cases))
-    return {"test_cases": test_cases, "run_token": run_token}
+    # Same class of gap, for Feature/feature_id (core/run_planning.py's ensure_features
+    # docstring) — must run here, before route_to_recon (graph/builder.py) depends on
+    # every test case's feature_id resolving to a real Feature.
+    features, test_cases = ensure_features(plan.features, test_cases)
+    return {"test_cases": test_cases, "features": features, "run_token": run_token}

@@ -26,3 +26,10 @@ class AuthState(TypedDict):
     pending_tool_calls: list[dict]
     turn_count: int
     auth_storage_state: str | None
+    # Mirrors WorkerState's fields of the same name (core/state.py) — same mechanism,
+    # same rationale: a wall-clock deadline checked at the top of every auth_agent_node
+    # turn, and an abort_reason set on a session-open timeout or exceeded deadline so
+    # auth_save_node can degrade to unauthenticated cleanly instead of an uncaught
+    # exception crashing the whole run before any worker branch even starts.
+    deadline_at: float | None
+    abort_reason: str | None

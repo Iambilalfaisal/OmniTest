@@ -1,6 +1,10 @@
 """DAG assembly: planner_node -> plan_review_node (human-in-the-loop) ->
+auth_setup_node -> [recon_node fan-out -> recon_join_node barrier] ->
 Send-based fan-out over worker_node -> reporter_node -> memory_node."""
 from __future__ import annotations
+
+import logging
+import os
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -8,13 +12,30 @@ from langgraph.types import Send, interrupt
 
 from ..core import progress
 from ..core.llm import LLM_RETRY_POLICY
-from ..core.models import TestCase
+from ..core.models import FlowReport, ScenarioProposal, TestCase
 from ..core.state import QAState
 from ..nodes.auth import build_auth_subgraph
 from ..nodes.memory import memory_node
 from ..nodes.planner import planner_node
+from ..nodes.recon import build_recon_subgraph
 from ..nodes.reporter import reporter_node
 from ..nodes.worker import build_worker_subgraph
+
+# Kill switch (plan decision D3): unset/false makes the run behave EXACTLY as it did
+# before recon existed — route_to_recon skips straight to recon_join_node, which is
+# then a harmless no-op (flow_reports stays empty, so it contributes no new test
+# cases). Deliberately NOT required — recon is new, unverified-by-a-live-run behavior
+# (see the plan's own step 8), so it must be an explicit opt-in, not a silent default.
+RECON_ENABLED = os.getenv("RECON_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+# Global cap across ALL Features' recon-discovered scenarios combined — separate from
+# nodes/recon/nodes.py's own SCENARIOS_PER_FEATURE_MAX, which only bounds a single
+# chatty Feature. This is the one that actually bounds total run cost/wall-clock when
+# several Features each recon'd close to their own per-feature cap. Recon proposes
+# RANKED scenarios; this is where the budget truncates — see recon_join_node.
+SCENARIOS_PER_RUN_MAX = int(os.getenv("SCENARIOS_PER_RUN_MAX", "18"))
+
+_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 async def plan_review_node(state: QAState) -> dict:
@@ -38,23 +59,119 @@ def route_after_plan_review(state: QAState) -> str:
     return "auth_setup_node" if state["plan_approved"] else "reporter_node"
 
 
+def route_to_recon(state: QAState, config: RunnableConfig):
+    """auth_setup_node's outgoing edge. When RECON_ENABLED and the plan has at least one
+    Feature, Sends one recon_node instance per Feature — each interactively explores
+    that Feature's real flows (nodes/recon/) BEFORE any worker touches the browser for
+    graded execution, since a strictly read-only crawl (nodes/planner_explore.py) can
+    never see a flow that sits behind a click. Otherwise routes straight to
+    recon_join_node, which is then a harmless no-op pass-through — this is what makes
+    RECON_ENABLED=false degrade to exactly today's behavior, not a parallel code path.
+
+    Also pre-registers every Feature in core/progress.py as `exploring`, before any
+    recon_node branch has actually started — same rationale as route_to_workers' own
+    pre-registration below: without this, the SSE `progress` payload (api.py) would show
+    nothing at all for however long recon takes, indistinguishable from a stalled run.
+    """
+    if not RECON_ENABLED or not state.get("features"):
+        return "recon_join_node"
+    run_id = config["configurable"]["thread_id"]
+    for feature in state["features"]:
+        progress.register_feature(run_id, feature.feature_id, name=feature.name)
+    return [
+        Send(
+            "recon_node",
+            {
+                "target_url": state["target_url"],
+                "run_token": state["run_token"],
+                "discovery_context": state.get("discovery_context", ""),
+                "feature": feature,
+            },
+        )
+        for feature in state["features"]
+    ]
+
+
+def _test_case_from_scenario(flow: FlowReport, scenario: ScenarioProposal, index: int) -> TestCase:
+    return TestCase(
+        test_id=f"{flow.flow_id}-{index + 1}",
+        goal=scenario.goal,
+        category=scenario.category,
+        priority=scenario.priority,
+        requires_auth=False,  # recon writes each scenario's OWN entry steps inline (see ScenarioProposal.steps)
+        preconditions=[f"Discovered by recon: {flow.flow_name}"],
+        expected_result=scenario.expected_result,
+        steps=scenario.steps,
+        feature_id=flow.feature_id,
+        flow_id=flow.flow_id,
+        origin="recon",
+        discovery_rationale=scenario.rationale,
+    )
+
+
+def recon_join_node(state: QAState) -> dict:
+    """Barrier node reached via a PLAIN edge from recon_node (build_graph below), not a
+    conditional one. CONFIRMED 2026-08-22, empirically, against installed langgraph
+    1.2.11: this is required for correctness, not a style choice — a conditional edge
+    issuing a LATER Send into a node a normal edge already settled past double-fires the
+    downstream node (reporter_node) with corrupted, compounding state (reproduced
+    directly in a minimal harness). A plain edge forces LangGraph to wait for EVERY
+    currently-active recon_node branch (one per Feature) to finish before this runs even
+    once, so route_to_workers (next) always sees the FULL, final set of
+    recon-discovered scenarios — never a partial one. When route_to_recon skipped recon
+    entirely, `flow_reports` is simply empty and this is a harmless no-op.
+
+    Applies SCENARIOS_PER_RUN_MAX globally across ALL Features' FlowReports combined,
+    sorted by (priority, rank) — nodes/recon/nodes.py's own SCENARIOS_PER_FEATURE_MAX
+    already capped each Feature individually; this only trims further if MULTIPLE
+    Features each proposed close to their own per-feature cap. Truncation is logged, not
+    silent — a silently-capped run would read as complete coverage when it isn't.
+    """
+    all_scenarios = [(flow, s) for flow in state.get("flow_reports", []) for s in flow.scenarios]
+    all_scenarios.sort(key=lambda item: (_PRIORITY_ORDER.get(item[1].priority, 1), item[1].rank))
+    kept = all_scenarios[:SCENARIOS_PER_RUN_MAX]
+    dropped = len(all_scenarios) - len(kept)
+    if dropped > 0:
+        logging.warning(
+            "recon_join_node: SCENARIOS_PER_RUN_MAX=%d — dropped %d of %d recon-discovered scenarios",
+            SCENARIOS_PER_RUN_MAX,
+            dropped,
+            len(all_scenarios),
+        )
+
+    by_flow_index: dict[str, int] = {}
+    accepted = []
+    for flow, scenario in kept:
+        i = by_flow_index.get(flow.flow_id, 0)
+        accepted.append(_test_case_from_scenario(flow, scenario, i))
+        by_flow_index[flow.flow_id] = i + 1
+
+    return {"test_cases": accepted}
+
+
 def route_to_workers(state: QAState, config: RunnableConfig):
-    """auth_setup_node's outgoing edge — by construction (see route_entry and
-    route_after_plan_review) this is only ever reached with plan_approved already True,
-    so unlike the pre-Stage-3 version of this function there's no unapproved-plan branch
-    to check here anymore. Stage 3: auth_storage_state (set once by auth_setup_node) is
-    only threaded into a given worker's payload when that test case actually declared
-    requires_auth — a case that didn't ask for a shared login shouldn't have one silently
-    injected into its browser.
+    """recon_join_node's outgoing edge (formerly auth_setup_node's directly — recon_node
+    /recon_join_node now sit between the two; see build_graph below). By construction
+    (see route_entry and route_after_plan_review) this is only ever reached with
+    plan_approved already True, so unlike the pre-Stage-3 version of this function
+    there's no unapproved-plan branch to check here anymore. Stage 3: auth_storage_state
+    (set once by auth_setup_node) is only threaded into a given worker's payload when
+    that test case actually declared requires_auth — a case that didn't ask for a shared
+    login shouldn't have one silently injected into its browser.
+
+    Reads state["test_cases"] AFTER recon_join_node's merge (core/state.py's
+    _merge_test_cases reducer) — this function itself needs no recon-awareness at all,
+    since a recon-discovered scenario is a real TestCase by the time it gets here,
+    indistinguishable from a planner-authored one to everything downstream.
 
     Also pre-registers every test case in core/progress.py as `queued`, before any
     worker_node branch has actually started — this is the one point in the whole graph
-    where every TestCase in the approved plan is visited together with the run's
-    thread_id, so it's the only place that can seed the FULL set up front. Without this,
-    the SSE `progress` payload (api.py) would only ever show a test case once its own
-    agent_node's first turn happens to land, so a card that hasn't been scheduled onto a
-    free MAX_CONCURRENT_WORKERS slot yet would be indistinguishable from one that
-    doesn't exist.
+    where every TestCase in the approved (and now recon-augmented) plan is visited
+    together with the run's thread_id, so it's the only place that can seed the FULL set
+    up front. Without this, the SSE `progress` payload (api.py) would only ever show a
+    test case once its own agent_node's first turn happens to land, so a card that
+    hasn't been scheduled onto a free MAX_CONCURRENT_WORKERS slot yet would be
+    indistinguishable from one that doesn't exist.
     """
     run_id = config["configurable"]["thread_id"]
     auth_state = state.get("auth_storage_state")
@@ -93,8 +210,11 @@ def build_graph(checkpointer, store=None):
     graph.add_node("planner_node", planner_node, retry_policy=LLM_RETRY_POLICY)
     graph.add_node("plan_review_node", plan_review_node)
     # Subgraph-as-node, like worker_node below — no retry_policy at this level, since
-    # each of its own nodes (nodes/auth/nodes.py) already carries its own.
+    # each of its own nodes (nodes/auth/nodes.py, nodes/recon/nodes.py) already carries
+    # its own.
     graph.add_node("auth_setup_node", build_auth_subgraph())
+    graph.add_node("recon_node", build_recon_subgraph())
+    graph.add_node("recon_join_node", recon_join_node)
     graph.add_node("worker_node", build_worker_subgraph())
     graph.add_node("reporter_node", reporter_node)
     graph.add_node("memory_node", memory_node)
@@ -102,7 +222,12 @@ def build_graph(checkpointer, store=None):
     graph.add_conditional_edges(START, route_entry, ["planner_node", "auth_setup_node"])
     graph.add_edge("planner_node", "plan_review_node")
     graph.add_conditional_edges("plan_review_node", route_after_plan_review, ["auth_setup_node", "reporter_node"])
-    graph.add_conditional_edges("auth_setup_node", route_to_workers, ["worker_node"])
+    graph.add_conditional_edges("auth_setup_node", route_to_recon, ["recon_node", "recon_join_node"])
+    # PLAIN edge, not conditional — see recon_join_node's own docstring for why this is
+    # load-bearing, not stylistic: it's what forces LangGraph to wait for every
+    # Send-spawned recon_node branch (one per Feature) before recon_join_node runs.
+    graph.add_edge("recon_node", "recon_join_node")
+    graph.add_conditional_edges("recon_join_node", route_to_workers, ["worker_node"])
     graph.add_edge("worker_node", "reporter_node")
     graph.add_edge("reporter_node", "memory_node")
     graph.add_edge("memory_node", END)

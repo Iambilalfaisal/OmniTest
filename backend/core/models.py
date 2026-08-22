@@ -67,6 +67,11 @@ step navigate to it explicitly.
 - test_id: short, stable, lowercase-with-hyphens, derived from the behavior under test —
   "login-wrong-password", "signup-duplicate-email", "search-no-results". Unique across
   the whole plan.
+- feature_id: before writing any test case, first name the small number of high-level
+  features the instruction covers (1-4 is typical — e.g. "sign-up", "login",
+  "create-agent") and list them in your separate features output. Every test case's
+  feature_id must be one of those exact ids — never invent a feature_id that isn't in
+  your own features list, and never leave a case's feature_id unset.
 - goal: one sentence in the form "<action> should <expected outcome>", e.g. "Logging in
   with a wrong password should be rejected with an error". Never a bare feature name like
   "Test login" or "Check the signup page".
@@ -324,16 +329,146 @@ class TestCase(BaseModel):
         "steps unless requires_auth is true, since each case runs in full isolation. Do not add a trailing "
         "'verify ...' step — grading against expected_result happens automatically after the last step."
     )
+    # Feature -> Flow -> Scenario hierarchy (this TestCase IS one Scenario — the only
+    # level that actually executes a browser; Feature/Flow are reporting-only groupings,
+    # never graded themselves). All optional/defaulted so a planner-authored baseline
+    # case — which doesn't know about any of this — still validates unchanged; a
+    # currently-unset feature_id/flow_id just means "ungrouped" to the reporter/frontend
+    # rather than a validation error. Not yet populated by any producing path as of this
+    # change (nodes/planner.py, nodes/discovery.py) — that's nodes/recon/'s job.
+    feature_id: str | None = Field(
+        default=None,
+        description="The Feature this scenario belongs to (e.g. 'sign-up') — set by the planner/discovery "
+        "chat for a baseline case, or inherited from the Flow a recon pass discovered this scenario under.",
+    )
+    flow_id: str | None = Field(
+        default=None,
+        description="The specific Flow within feature_id this scenario exercises (e.g. 'sign-up-google-oauth' "
+        "under feature_id 'sign-up') — None for a baseline case with no recon-discovered flow breakdown.",
+    )
+    origin: Literal["planner", "recon"] = Field(
+        default="planner",
+        description="'planner' for a case the one-shot planner or discovery chat authored directly from the "
+        "target page's accessibility tree/site map. 'recon' for a case a recon pass generated from a "
+        "FlowReport it gathered by actually interacting with that flow — see discovery_rationale for why.",
+    )
+    discovery_rationale: str | None = Field(
+        default=None,
+        description="Why THIS specific scenario was generated, grounded in what recon actually observed "
+        "(e.g. \"recon found a Google OAuth button on the sign-up form\") — None for a planner-origin case, "
+        "whose rationale is just TEST_CASE_AUTHORING_GUIDELINES' coverage checklist.",
+    )
+    depends_on_sibling: str | None = Field(
+        default=None,
+        description="test_id of another scenario in this SAME flow that must complete first (e.g. "
+        "'signup-happy-path' for a 'signup-duplicate-email' case that needs that account to already exist) "
+        "— None (the default, and every planner-origin case) means fully independent and safe to run in "
+        "parallel like every other case. Only set this when the dependency is a genuinely observed one, "
+        "never a guess — the ordinary rule remains 'no shared state between test cases'.",
+    )
+
+
+class Feature(BaseModel):
+    """A high-level testing objective the planner/discovery chat identified from the
+    user's instruction (e.g. "Sign-Up", "Create Agent") — the top level of the Feature
+    -> Flow -> Scenario hierarchy every TestCase's feature_id/flow_id groups into. Never
+    itself graded: reporter_node aggregates its scenarios' TestResults into a rollup
+    (by_feature) instead of producing a Feature-level verdict of its own.
+    """
+
+    feature_id: str = Field(
+        description="Short, stable, lowercase-with-hyphens id, e.g. 'sign-up'. Unique across the plan."
+    )
+    name: str = Field(description="Human-readable name shown in the UI, e.g. 'Sign-Up'.")
+    description: str = Field(
+        description="One sentence: what this feature covers and why it's in scope for this run's instruction."
+    )
 
 
 class TestPlan(BaseModel):
     """Structured-output contract the planner LLM call is constrained to."""
 
+    features: list[Feature] = Field(
+        description="The small number of high-level testing objectives this instruction covers (e.g. "
+        "'Sign-Up', 'Create Agent') — typically 1-4. Every test_case below must set its own feature_id to "
+        "one of these feature_id values."
+    )
     test_cases: list[TestCase] = Field(
         description="The smallest set in which every case is high-value — typically ~5-12 for a normal "
         "instruction. Must cover the happy path plus the most important negative, edge-case and "
         "error-handling cases for the flows in scope."
     )
+
+
+class ScenarioProposal(BaseModel):
+    """One scenario a recon pass proposes for a Flow it just gathered evidence on —
+    ranked so SCENARIOS_PER_FEATURE_MAX/SCENARIOS_PER_RUN_MAX (nodes/recon/) can
+    truncate by dropping the lowest-ranked proposals rather than arbitrarily. Turned
+    into a full TestCase (feature_id/flow_id/discovery_rationale/origin='recon' set from
+    the enclosing FlowReport) once accepted — never executed directly itself.
+    """
+
+    goal: str = Field(description="Same contract as TestCase.goal — one sentence, '<action> should <outcome>'.")
+    category: TestCategory
+    priority: TestPriority = "medium"
+    rationale: str = Field(
+        description="Why this scenario matters for THIS application specifically, grounded in what recon "
+        "actually observed (e.g. \"the sign-up form has a Google OAuth button\") — never a generic "
+        "justification a static checklist could have produced for any site."
+    )
+    rank: int = Field(
+        description="Recon's own priority ordering within this Flow — lower is more important. Used to "
+        "truncate under a scenario budget without discarding arbitrarily."
+    )
+    # Without these two, this "scenario" would be a goal statement with nothing for a
+    # worker to execute or grade against — a real gap in the first draft of this model,
+    # caught before graph wiring made it load-bearing. Same contract as TestCase's own
+    # fields of the same name (core/models.py above); recon_plan_node writes both from
+    # the SAME synthesis call that produces this proposal, grounded in the exploration
+    # transcript it just gathered rather than invented.
+    expected_result: str = Field(
+        description="Same contract as TestCase.expected_result — the ONE observable outcome that decides "
+        "Pass/Fail, naming a visible message/page/element actually seen (or plausible given what was "
+        "observed) during exploration. Never vague."
+    )
+    steps: list[str] = Field(
+        description="Same contract as TestCase.steps — ordered, one action per step, every typed value "
+        "literal and in quotes, phrased by the EXACT visible label observed during exploration. Include "
+        "any prerequisite navigation (e.g. clicking to the flow's entry point) as the first steps, since "
+        "each scenario runs in full isolation from a fresh browser, exactly like a planner-authored case."
+    )
+
+
+class FlowReport(BaseModel):
+    """Grounded evidence a recon pass gathered for ONE Flow within a Feature (e.g.
+    "Google OAuth" under the "Sign-Up" feature) by actually interacting with it — the
+    artifact that lets scenario generation run TEST_CASE_AUTHORING_GUIDELINES' method
+    against what THIS application actually has, instead of the static per-flow-type
+    checklist. Cached the same way SiteMap already is (core/memory.py's
+    SITE_MAP_KEY/SITE_MAP_TTL_HOURS pattern) so a second run against the same site skips
+    recon entirely.
+    """
+
+    feature_id: str
+    flow_id: str = Field(description="Short, stable, lowercase-with-hyphens id, e.g. 'sign-up-google-oauth'.")
+    flow_name: str = Field(
+        description="Human-readable name for this specific flow, e.g. 'Email + Password', 'Google OAuth'."
+    )
+    observed_fields: list[str] = Field(
+        default_factory=list,
+        description="Every input/control recon actually saw for this flow, by exact visible label.",
+    )
+    observed_validation: list[str] = Field(
+        default_factory=list,
+        description="Exact validation/error messages recon actually triggered or saw for this flow.",
+    )
+    blocked_by: str | None = Field(
+        default=None,
+        description="A named external wall (CAPTCHA, OTP, paywall) that stopped recon from completing this "
+        "flow, if any — mirrors Verdict's own Blocked reasoning (nodes/worker/nodes.py).",
+    )
+    scenarios: list[ScenarioProposal] = Field(default_factory=list)
+    crawled_at: str | None = Field(default=None, description="ISO timestamp, set when persisted to the long-term store.")
 
 
 class TestResult(BaseModel):

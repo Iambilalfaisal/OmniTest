@@ -10,7 +10,8 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
-from .models import TestCase, TestResult
+from .models import Feature, FlowReport, TestCase, TestResult
+from .run_planning import ensure_unique_test_ids
 
 
 def _keep_latest(_current: str, new: str) -> str:
@@ -40,6 +41,29 @@ def _keep_latest_auth_state(_current: str | None, new: str | None) -> str | None
     return new
 
 
+def _merge_test_cases(current: list[TestCase], new: list[TestCase]) -> list[TestCase]:
+    """Reducer for QAState.test_cases — required once recon (nodes/recon/) can append
+    newly-discovered scenarios to this SAME field from parallel Send-spawned branches,
+    alongside auth_setup_node's baseline write, in the same superstep (see
+    graph/builder.py's route_to_recon/route_to_workers). `test_cases` had NO reducer at
+    all before this, which was safe only because planner_node was its one and only
+    writer, always alone, before any fan-out existed — N branches writing it in the same
+    superstep now would otherwise hit the identical `InvalidUpdateError` `_keep_latest`
+    above exists to avoid.
+
+    Concatenates, then re-applies `ensure_unique_test_ids` (core/run_planning.py) over
+    the COMBINED list — plain `operator.add` only concatenates: a parallel recon branch
+    cannot see what its SIBLING branches are generating in the same superstep, so id
+    uniqueness (session_key/evidence-dir collisions ride on it — see that function's own
+    docstring) is unachievable at production time and must be enforced here, at merge
+    time, instead. Deterministic and idempotent by construction: `ensure_unique_test_ids`
+    walks the list in a fixed order and only suffixes an id that's ALREADY taken, so a
+    LangGraph node replay re-running this reducer over the same current+new never
+    renumbers an id it already assigned on an earlier pass.
+    """
+    return ensure_unique_test_ids([*current, *new])
+
+
 class QAState(TypedDict):
     target_url: Annotated[str, _keep_latest]
     instruction: str
@@ -47,7 +71,23 @@ class QAState(TypedDict):
                              # (credentials, user preferences/clarifications); "" if none.
     run_token: str  # set by planner_node — a run-unique, non-LLM value injected into
                      # PLANNER_PROMPT for unique generated test data (see core/run_planning.py).
-    test_cases: list[TestCase]
+    test_cases: Annotated[list[TestCase], _merge_test_cases]
+    # Features the planner/discovery chat identified from the user's instruction (e.g.
+    # "Sign-Up", "Create Agent") — the top level of the Feature -> Flow -> Scenario
+    # hierarchy (core/models.py's Feature). Written once, before any fan-out (same
+    # lifecycle as test_cases' own planner_node write used to be alone), so no reducer
+    # is needed yet — nothing downstream of the planner currently adds a NEW Feature
+    # mid-run, only new Scenarios (TestCases) under an already-declared one.
+    features: list[Feature]
+    # Grounded evidence recon gathered per Flow (core/models.py's FlowReport) — one
+    # entry per Flow across however many Features had one recon'd. `operator.add`, not
+    # `_merge_test_cases`'s dedup-by-id merge: FlowReport has no id collision risk
+    # analogous to TestCase.test_id (nothing downstream keys a browser session or
+    # evidence directory off flow_id the way session_key does off test_id), and unlike
+    # test_cases, nothing PRE-fan-out ever writes this — every write is a parallel
+    # recon branch appending its own one-element contribution, the same shape
+    # test_results' own operator.add reducer already handles for worker_node.
+    flow_reports: Annotated[list[FlowReport], operator.add]
     test_results: Annotated[list[TestResult], operator.add]
     summary: dict
     plan_approved: bool
@@ -100,3 +140,19 @@ class WorkerState(TypedDict):
     # only when test_case.requires_auth is True; None otherwise. No reducer needed here:
     # unlike QAState's copy, nothing inside this subgraph ever rewrites it.
     auth_storage_state: str | None
+    # Wall-clock backstop (nodes/agent_loop.py's SCENARIO_DEADLINE_SECONDS) — a
+    # time.monotonic() value agent_node sets on turn 1 and checks on every later turn,
+    # short-circuiting to verdict_node as Blocked if exceeded. Pushed forward (not
+    # accumulated) by tool_node after a genuine human-in-the-loop pause resumes, so a
+    # slow human answer never itself trips the deadline. No reducer needed — same class
+    # as turn_budget above: only this one worker's own sequential nodes ever write it.
+    deadline_at: float | None
+    # Set by agent_node/tool_node when this leaf can't make progress through no fault of
+    # the test case itself — a session-open timeout, or an exceeded deadline_at above —
+    # instead of letting the underlying exception propagate uncaught and crash the WHOLE
+    # run (see mcp/client.py's invoke_tool docstring for why a raise here is unsafe).
+    # verdict_node checks this FIRST and returns a deterministic Blocked TestResult,
+    # skipping the LLM grading call and the final browser_snapshot fetch entirely, since
+    # grading against a browser that may itself be the thing that's wedged is meaningless
+    # and risks the exact same hang this mechanism exists to bound.
+    abort_reason: str | None

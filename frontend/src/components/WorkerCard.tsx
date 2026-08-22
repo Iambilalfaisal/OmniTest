@@ -15,6 +15,45 @@ export type TestCase = {
   // a plan persisted before the field existed still renders instead of crashing.
   expected_result?: string;
   steps: string[];
+  // Feature -> Flow -> Scenario hierarchy (backend/core/models.py, backend/nodes/recon/)
+  // — all optional so a plan from before this hierarchy existed still renders as a flat,
+  // ungrouped card instead of crashing. feature_id is a grouping key only, never shown
+  // directly — RunPageClient.tsx's groupedPlan joins it against a real Feature's `name`.
+  feature_id?: string | null;
+  flow_id?: string | null;
+  // "planner" (the one-shot/discovery-chat plan) or "recon" (nodes/recon/ discovered
+  // this scenario by actually interacting with the app) — undefined for a pre-hierarchy
+  // plan, treated the same as "planner".
+  origin?: "planner" | "recon";
+  // Why THIS scenario was generated, grounded in what recon actually observed — only
+  // ever set for origin === "recon".
+  discovery_rationale?: string | null;
+};
+
+// A high-level testing objective (backend/core/models.py's Feature) — the top level of
+// the Feature -> Flow -> Scenario hierarchy every TestCase's feature_id groups into.
+export type Feature = {
+  feature_id: string;
+  name: string;
+  description: string;
+};
+
+export type FeaturePhase = "exploring" | "done";
+
+// Live recon status for one Feature (backend/core/progress.py's register_feature/
+// update_feature, streamed via the SSE `progress` event's `feature_progress` map) —
+// the only live signal while recon_node/recon_join_node run, since no TestCase/
+// WorkerProgress entry exists yet for a scenario recon hasn't discovered.
+export type FeatureProgress = {
+  name: string;
+  phase: FeaturePhase;
+  scenario_count: number;
+  updated_at: number;
+};
+
+export const FEATURE_PHASE_LABELS: Record<FeaturePhase, string> = {
+  exploring: "Analyzing application…",
+  done: "Discovery complete",
 };
 
 export type TestResult = {
@@ -241,6 +280,14 @@ export default function WorkerCard({
                 {CATEGORY_LABELS[testCase.category] ?? testCase.category}
               </span>
             )}
+            {testCase.origin === "recon" && (
+              <span
+                className="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-0.5 font-semibold text-fuchsia-300"
+                title="Discovered by exploring the real application, not written from a static checklist"
+              >
+                Discovered
+              </span>
+            )}
           </div>
           <h3 className="mt-2 text-xl font-semibold text-white">{testCase.goal}</h3>
           {testCase.preconditions?.length > 0 && (
@@ -250,6 +297,12 @@ export default function WorkerCard({
             <p className="mt-1 text-xs text-slate-400">
               <span className="font-semibold text-slate-300">Expected: </span>
               {testCase.expected_result}
+            </p>
+          )}
+          {testCase.discovery_rationale && (
+            <p className="mt-1 text-xs text-fuchsia-300/80">
+              <span className="font-semibold">Why this scenario: </span>
+              {testCase.discovery_rationale}
             </p>
           )}
         </div>

@@ -26,7 +26,7 @@ from ..core.discovery_state import DiscoveryState
 from ..core.llm import ModelRole, with_fallback
 from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, DiscoveryTurn, SiteMap
-from ..core.run_planning import ensure_expected_result, generate_run_token
+from ..core.run_planning import ensure_expected_result, ensure_features, generate_run_token
 from ..mcp.client import open_playwright_session
 from .planner import PLANNER_CRAWL_MAX_DEPTH, PLANNER_CRAWL_MAX_PAGES
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -207,8 +207,11 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
     # omit this required field, and this candidate_plan is read again next turn (by
     # _format_candidate_plan/_context_message above) as well as by the frontend — so it
     # must be backfilled every turn, not only once at final approval in api.py.
+    # ensure_features is the same defense for Feature/feature_id.
+    fixed_test_cases = ensure_expected_result(turn.candidate_plan.test_cases)
+    fixed_features, fixed_test_cases = ensure_features(turn.candidate_plan.features, fixed_test_cases)
     candidate_plan = turn.candidate_plan.model_copy(
-        update={"test_cases": ensure_expected_result(turn.candidate_plan.test_cases)}
+        update={"test_cases": fixed_test_cases, "features": fixed_features}
     )
 
     return {

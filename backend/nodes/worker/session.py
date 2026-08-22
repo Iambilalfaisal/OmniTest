@@ -27,6 +27,14 @@ from .evidence import discard_action_overlay, start_capture
 SESSION_IDLE_TTL_SECONDS = float(os.getenv("SESSION_IDLE_TTL_SECONDS", "1800"))
 SESSION_REAP_INTERVAL_SECONDS = float(os.getenv("SESSION_REAP_INTERVAL_SECONDS", "300"))
 
+# Wall-clock bound on OPENING a session (spawning `npx @playwright/mcp`, launching
+# Chromium, completing the MCP handshake) — separate from TOOL_CALL_TIMEOUT_SECONDS
+# (agent_loop.py), which bounds a call made THROUGH an already-open session. A slow
+# first-time `npx` package fetch or a wedged subprocess previously had no bound at all:
+# `SessionHandle.wait_ready()` just awaited an `asyncio.Event` that only a successful
+# (or failed) `_run()` ever sets.
+SESSION_OPEN_TIMEOUT_SECONDS = float(os.getenv("SESSION_OPEN_TIMEOUT_SECONDS", "60"))
+
 
 class SessionGoneError(Exception):
     """Raised by `get_session(key, require_existing=True)` when the session isn't
@@ -77,11 +85,31 @@ class SessionHandle:
         finally:
             self._closed.set()
 
-    async def wait_ready(self) -> list:
-        await self._ready.wait()
+    async def wait_ready(self, *, timeout: float | None = None) -> list:
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # `close()` can't abandon a stuck open: it only sets `_close_requested`,
+            # which `_run()` doesn't check until AFTER `open_playwright_session`
+            # returns — so a genuinely wedged open would never see it. Cancelling
+            # `_task` directly interrupts whatever `_run()` is awaiting; its
+            # `AsyncExitStack` still unwinds normally on cancellation.
+            await self.cancel()
+            raise
         if self.error is not None:
             raise self.error
         return self.tools
+
+    async def cancel(self) -> None:
+        """Abandons an in-flight open that's taking too long (see `wait_ready`'s
+        timeout above). Idempotent — safe to call again from `close()`/`get_session`'s
+        cleanup even after this already ran."""
+        self._task.cancel()
+        try:
+            await self._task
+        except BaseException:  # noqa: BLE001 - task cancellation/any startup failure, already abandoning it
+            pass
+        self._closed.set()
 
     async def close(self) -> None:
         self._close_requested.set()
@@ -123,9 +151,19 @@ async def get_session(key: str, *, require_existing: bool = False) -> tuple:
         # within one run's log means exactly that happened.
         logging.info("opening Playwright session for %s", key)
         handle = SessionHandle()
-        tools = await handle.wait_ready()
-        tool_map = {t.name: t for t in tools}
-        await start_capture(tool_map, key)
+        try:
+            tools = await handle.wait_ready(timeout=SESSION_OPEN_TIMEOUT_SECONDS)
+            tool_map = {t.name: t for t in tools}
+            await start_capture(tool_map, key)
+        except Exception:
+            # Pre-existing leak this fix closes as a side effect: on any failure here
+            # (not just the new open-timeout — start_capture failing too), `handle`
+            # was never stored in `_SESSIONS` and therefore never closed by anything —
+            # an orphaned `npx @playwright/mcp` subprocess/Chromium for the life of the
+            # process. `close()` is safe even if `wait_ready` already cancelled it
+            # (idempotent, see `SessionHandle.cancel`).
+            await handle.close()
+            raise
         _SESSIONS[key] = (handle, tools, tool_map)
     _LAST_USED[key] = time.monotonic()
     return _SESSIONS[key]

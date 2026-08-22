@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -25,14 +26,17 @@ from ...core.llm import LLM_RETRY_POLICY, ModelRole, with_fallback
 from ...core.models import TestResult
 from ...core.run_context import run_id_var, test_id_var
 from ...core.state import WorkerState
+from ...mcp.client import invoke_tool, invoke_tool_or_error_text
 from ..agent_loop import (
     ASK_HUMAN_TOOL_NAME,
     DEVIATION_POLICY,
     EXCLUDED_TOOL_NAMES,
+    SCENARIO_DEADLINE_SECONDS,
     _risky_text_from_args,
     ask_human_and_reply,
     ask_human_tool,
     compact_history,
+    new_deadline,
     review_if_risky,
     stale_snapshot_replacements,
     truncate_tool_result,
@@ -45,7 +49,7 @@ from .evidence import (
     run_dir_for,
     stop_and_capture,
 )
-from .session import discard_session, get_session, session_key
+from .session import SessionGoneError, discard_session, get_session, session_key
 
 # Stage 2: dropped from a hardcoded 20 to an env-tunable default of 8. 20 was set
 # before two request-reducing fixes landed: multi-action turns (below, WORKER_SYSTEM_PROMPT)
@@ -289,11 +293,35 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_id_var.set(test_case.test_id)  # see core/run_context.py — set per-node, not
     # inherited, since LangGraph runs each node as its own separate asyncio task.
     run_id = run_id_var.get()
+
+    # Wall-clock backstop (agent_loop.SCENARIO_DEADLINE_SECONDS), checked before doing
+    # any work this turn. Set once on turn 1 (deadline_at is None), then just carried
+    # forward every later turn — except tool_node pushes it forward after a genuine
+    # ask_human/risky-action pause resumes, so a slow human answer never trips this.
+    # MAX_TOOL_TURNS_CEILING already bounds turn COUNT; this bounds the sum of a case
+    # that times out on nearly every tool call instead of ever converging.
+    now = time.monotonic()
+    deadline_at = state.get("deadline_at")
+    if deadline_at is None:
+        deadline_at = now + SCENARIO_DEADLINE_SECONDS
+    elif now > deadline_at:
+        return {"pending_tool_calls": [], "abort_reason": f"exceeded its {SCENARIO_DEADLINE_SECONDS:.0f}s execution deadline"}
+
     # Flips this card from `queued` (route_to_workers' pre-registration) to `running`
     # as soon as this test case's OWN first turn actually starts, rather than only once
     # the (potentially slow) model call below returns.
     progress.update(run_id, test_case.test_id, phase="running", total_steps=len(test_case.steps))
-    _, tools, tool_map = await get_session(session_key(config, test_case.test_id))
+    try:
+        _, tools, tool_map = await get_session(session_key(config, test_case.test_id))
+    except Exception as exc:
+        # A session that never opens (or whose tracing/video setup fails — see
+        # session.py's get_session) would otherwise raise uncaught here, and this node
+        # carries LLM_RETRY_POLICY — 3 attempts, then propagates and crashes the WHOLE
+        # run (LangGraph's executor re-raises the first exception across every
+        # concurrently-running Send-spawned branch on exit, not just this one). Abort
+        # just this leaf instead; verdict_node turns abort_reason into a Blocked result.
+        logging.exception("agent_node: failed to open a session for %s — aborting this test case", test_case.test_id)
+        return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
     offered_tools = [t for t in tools if t.name not in EXCLUDED_TOOL_NAMES]
 
     # `messages` uses the `add_messages` reducer (append-only) — the seed below must be
@@ -319,7 +347,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
                 # auth_state is a file path (see nodes/auth/nodes.py) — confirmed against
                 # the installed @playwright/mcp's tool schema that browser_set_storage_state
                 # restores from a file via `filename`, not an inline blob.
-                await set_storage_state_tool.ainvoke({"filename": auth_state})
+                await invoke_tool(set_storage_state_tool, {"filename": auth_state})
             except Exception:
                 logging.exception(
                     "agent_node: failed to inject shared auth storage state for %s — "
@@ -414,6 +442,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         "pending_tool_calls": response.tool_calls,
         "turn_count": state.get("turn_count", 0) + 1,
         "turn_budget": turn_budget,
+        "deadline_at": deadline_at,
     }
 
 
@@ -448,8 +477,12 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
         # exactly as it does for a real ask_human reply.
         reused = run_knowledge.find_answer(run_id, question)
         if reused is not None:
-            tool_map = await _tool_map()
-            fresh_snapshot = truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
+            try:
+                tool_map = await _tool_map()
+            except Exception as exc:
+                logging.exception("tool_node: failed to open a session for %s — aborting this test case", test_id)
+                return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
+            fresh_snapshot = truncate_tool_result(await invoke_tool_or_error_text(tool_map["browser_snapshot"], {}))
             reply = ToolMessage(
                 content=(
                     f"[Already answered earlier in this run by another test case.] {reused['answer']}\n\n"
@@ -470,21 +503,42 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
                 updates["sensitive_answers"] = [*state.get("sensitive_answers", []), reused["answer"]]
             return updates
 
-        reply, answer_text, sensitive = await ask_human_and_reply(call, _tool_map, subject_id=test_id)
+        # get_session runs INSIDE ask_human_and_reply, only after interrupt() returns
+        # (its own docstring's deliberate ordering) — a failure there would otherwise
+        # propagate uncaught out of this node and crash the whole run, same reasoning
+        # as agent_node's session-open guard.
+        try:
+            reply, answer_text, sensitive = await ask_human_and_reply(call, _tool_map, subject_id=test_id)
+        except Exception as exc:
+            logging.exception("tool_node: failed to open a session resuming ask_human for %s — aborting", test_id)
+            return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
         run_knowledge.record_answer(run_id, question, answer_text, sensitive=sensitive)
         progress.update(run_id, test_id, phase="running", current_action=None)
         progress.bump(run_id, test_id, "asks")
         # An answered ask_human earns the same budget bonus a handled deviation does
         # (see agent_node) — asking should never be the choice that runs a case out of
-        # turns faster than guessing would have.
+        # turns faster than guessing would have. deadline_at is likewise pushed forward
+        # a fresh SCENARIO_DEADLINE_SECONDS window (agent_loop.new_deadline) — a real
+        # interrupt()/resume just happened, and the wall-clock gap was human response
+        # time, not runaway execution.
         new_budget = min((state.get("turn_budget") or MAX_TOOL_TURNS) + TURN_BUDGET_BONUS, MAX_TOOL_TURNS_CEILING)
-        updates: dict = {"messages": [reply], "pending_tool_calls": remaining, "turn_budget": new_budget}
+        updates: dict = {
+            "messages": [reply],
+            "pending_tool_calls": remaining,
+            "turn_budget": new_budget,
+            "deadline_at": new_deadline(),
+        }
         if sensitive:
             updates["sensitive_answers"] = [*state.get("sensitive_answers", []), answer_text]
         return updates
 
     progress.update(run_id, test_id, phase="awaiting_input", current_action=f"reviewing: {call['name']}")
     decision = await review_if_risky(call, subject_id=test_id)
+    # A real interrupt()/resume happened whenever decision is not None (review_if_risky
+    # returns None with no pause for anything that isn't risky at all) — either way
+    # below, deadline_at gets pushed forward a fresh window, same reasoning as
+    # ask_human's real-pause branch above.
+    deadline_update = {"deadline_at": new_deadline()} if decision is not None else {}
     if decision is not None and not decision.get("approved", False):
         progress.update(run_id, test_id, phase="running", current_action=None)
         blocked = ToolMessage(
@@ -492,13 +546,17 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
             tool_call_id=call["id"],
             name=call["name"],
         )
-        return {"messages": [blocked], "pending_tool_calls": remaining}
+        return {"messages": [blocked], "pending_tool_calls": remaining, **deadline_update}
 
     # NOTE: a resume landing on a different process than the one that paused finds no
     # cached session here and transparently opens a fresh, unnavigated browser instead
     # of failing loudly — see the plan's accepted limitations for this exact scenario.
     key = session_key(config, test_id)
-    _, _, tool_map = await get_session(key)
+    try:
+        _, _, tool_map = await get_session(key)
+    except Exception as exc:
+        logging.exception("tool_node: failed to open a session for %s — aborting this test case", test_id)
+        return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
 
     # core/progress.py: what this test case is doing RIGHT NOW, for the SSE payload —
     # reuses agent_loop._risky_text_from_args' element/name/target extraction, since
@@ -515,7 +573,10 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     await ensure_action_overlay(tool_map, key)
 
     async def _do_action():
-        return await tool_map[call["name"]].ainvoke(call["args"])
+        # invoke_tool_or_error_text, not invoke_tool: this IS the tool-dispatch point —
+        # a raise here (no enclosing try/except) would crash the whole run, not just
+        # fail this one leaf (see mcp.client.invoke_tool's docstring).
+        return await invoke_tool_or_error_text(tool_map[call["name"]], call["args"])
 
     # Only a genuine page mutation gets its own clip — a read (browser_snapshot, etc.)
     # or an LLM turn deciding what to do next never had a camera running in the first
@@ -561,6 +622,7 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
         ],
         "pending_tool_calls": remaining,
         "video_clips": new_clips,
+        **deadline_update,
     }
 
 
@@ -603,10 +665,68 @@ def _redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+async def _abort_verdict(state: WorkerState, config: RunnableConfig, abort_reason: str) -> dict:
+    """Deterministic Blocked result for a leaf that agent_node/tool_node cut short
+    before ever reaching a real verdict call — a session-open timeout (get_session
+    never succeeded, so there is no browser to grade against) or an exceeded
+    deadline_at (the browser may itself be the thing that's wedged). Skips the LLM
+    verdict call and the fresh-snapshot fetch entirely: asking a possibly-unresponsive
+    browser for one more snapshot is exactly the kind of wait this mechanism exists to
+    bound, and grading against nothing is meaningless anyway. Still attempts teardown
+    (best-effort, tolerant of a session that never opened at all) so the slot and any
+    real subprocess this leaf held are actually released.
+    """
+    test_case = state["test_case"]
+    key = session_key(config, test_case.test_id)
+    logging.warning("verdict_node: aborting %s without grading — %s", key, abort_reason)
+
+    screenshot_path = ""
+    try:
+        handle, _, tool_map = await get_session(key, require_existing=True)
+    except SessionGoneError:
+        handle, tool_map = None, None
+
+    if tool_map is not None:
+        try:
+            run_dir = run_dir_for(key)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_path = await capture_screenshot(tool_map, run_dir)
+            close_tool = tool_map.get("browser_close")
+            if close_tool is not None:
+                await invoke_tool(close_tool, {})
+        except Exception:
+            logging.exception("verdict_node: best-effort evidence capture failed while aborting %s", key)
+        finally:
+            discard_session(key)
+            await handle.close()
+
+    progress.update(run_id_var.get(), test_case.test_id, phase="done", current_action=None)
+    return {
+        "test_results": [
+            TestResult(
+                test_id=test_case.test_id,
+                status="Blocked",
+                screenshot_path=screenshot_path,
+                trace_path=None,
+                video_clips=state.get("video_clips", []),
+                reason=f"Execution aborted before grading: {abort_reason}",
+                deviations=[],
+                amended_steps=[],
+                last_step_reached=state.get("turn_count", 0),
+            )
+        ]
+    }
+
+
 async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_case = state["test_case"]
     test_id_var.set(test_case.test_id)  # see agent_node's comment
     run_id = run_id_var.get()
+
+    abort_reason = state.get("abort_reason")
+    if abort_reason:
+        return await _abort_verdict(state, config, abort_reason)
+
     progress.update(run_id, test_case.test_id, phase="grading", current_action="grading")
     key = session_key(config, test_case.test_id)
     # require_existing=True: unlike agent_node/tool_node, this must NEVER silently open
@@ -621,7 +741,18 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
     # the agent was created, while the real final dashboard showed "Total Agents: 0" —
     # the remembered conversation didn't match the true current state. This costs one
     # extra MCP call, not an extra LLM call, so it's effectively free.
-    final_snapshot = truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
+    #
+    # Bounded and tolerant, unlike a bare ainvoke: a hang/timeout here would otherwise
+    # leave this leaf's own case ungraded AND (per invoke_tool's docstring) risk
+    # crashing every sibling test case's already-good results too. Falling back to a
+    # placeholder still produces a well-formed grading call — the verdict prompt below
+    # already treats "no evidence to point to" as a Fail, which is the correct outcome
+    # when the final page genuinely can't be observed.
+    try:
+        final_snapshot = truncate_tool_result(await invoke_tool_or_error_text(tool_map["browser_snapshot"], {}))
+    except Exception:
+        logging.exception("verdict_node: failed to capture the final page snapshot for %s", key)
+        final_snapshot = "[final snapshot unavailable — the browser did not respond in time]"
 
     # Found directly from a live run: a test case that spent most of its turn budget on
     # an unplanned signup detour, then hit the budget with the actual goal (typing
@@ -719,7 +850,7 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         trace_path = await stop_and_capture(tool_map, "browser_stop_tracing", run_dir / "trace.zip")
         close_tool = tool_map.get("browser_close")
         if close_tool is not None:
-            await close_tool.ainvoke({})
+            await invoke_tool(close_tool, {})
     except Exception:
         logging.exception("verdict_node evidence capture/teardown failed for %s — verdict itself still stands", key)
     finally:
@@ -767,6 +898,12 @@ def route_after_agent(state: WorkerState) -> str:
 
 
 def route_after_tool(state: WorkerState) -> str:
+    # Checked first: an abort (session-open timeout) leaves pending_tool_calls empty
+    # with turn_count possibly still under budget — without this, that would route back
+    # to agent_node, which would just hit the same dead session again next turn instead
+    # of reaching verdict_node's abort_reason short-circuit.
+    if state.get("abort_reason"):
+        return "verdict_node"
     if state["pending_tool_calls"]:
         return "tool_node"
     budget = state.get("turn_budget") or MAX_TOOL_TURNS

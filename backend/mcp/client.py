@@ -7,13 +7,62 @@ the same tab.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import AsyncExitStack
 from pathlib import Path
 
+from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
+
+# Wall-clock bound on a SINGLE MCP tool call (browser_click, browser_navigate, ...).
+# Before this, nothing anywhere in this codebase bounded how long a stalled browser/page
+# could hold a node — and therefore its MAX_CONCURRENT_WORKERS slot — since
+# `tool.ainvoke()` was called bare everywhere. `asyncio.TimeoutError` IS `TimeoutError`
+# on the installed Python (3.12) and is already an `Exception` subclass, so every
+# existing `except Exception` around a tool call (or the deliberate lack of one, where a
+# raise is expected to propagate) keeps behaving exactly as it does for any other tool
+# failure — this only bounds how long that failure can take to surface, converting an
+# unbounded hang into a bounded one.
+TOOL_CALL_TIMEOUT_SECONDS = float(os.getenv("TOOL_CALL_TIMEOUT_SECONDS", "90"))
+
+
+async def invoke_tool(tool: BaseTool, args: dict, *, timeout: float = TOOL_CALL_TIMEOUT_SECONDS):
+    """The ONE way any MCP tool is called in this codebase — every bare `tool.ainvoke()`
+    call site was replaced with this. Raises `TimeoutError` (== `asyncio.TimeoutError`)
+    after `timeout` seconds instead of hanging forever; callers that already wrap their
+    call in `except Exception` (or a caller like planner_node that's meant to fail the
+    whole node/run on any tool error) get identical behavior to today, just time-bounded.
+
+    NOT safe to use at a genuine tool-dispatch point inside `nodes/worker/nodes.py`'s
+    `tool_node` or `nodes/auth/nodes.py`'s `auth_tool_node` — a raise there is uncaught
+    and propagates out of the node; LangGraph's executor re-raises the first exception
+    across ALL concurrently-running Send-spawned branches on exit (confirmed against the
+    installed langgraph 1.2.11's `PregelExecutor`), so one leaf's tool timeout would
+    crash the WHOLE run, including every sibling test case's already-good results. Use
+    `invoke_tool_or_error_text` there instead.
+    """
+    return await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
+
+
+async def invoke_tool_or_error_text(tool: BaseTool, args: dict, *, timeout: float = TOOL_CALL_TIMEOUT_SECONDS) -> str:
+    """Same as `invoke_tool`, but NEVER raises — a timeout becomes descriptive text
+    instead, exactly like `langchain_mcp_adapters`' `handle_tool_errors=True` (below,
+    `open_playwright_session`) already converts a genuine MCP-side tool error into text
+    fed back to the model rather than a raised exception. Used at the actual
+    tool-dispatch point inside tool_node/auth_tool_node (and agent_loop.py's
+    ask_human_and_reply post-resume snapshot fetch) — the places a raise would crash
+    the whole run per `invoke_tool`'s docstring — so a stuck browser reads to the model
+    as "that action failed," letting the existing turn budget / stuck-nudge machinery
+    handle it as any other tool error, instead of taking down every sibling test case.
+    """
+    try:
+        return str(await invoke_tool(tool, args, timeout=timeout))
+    except asyncio.TimeoutError:
+        return f"[tool call '{tool.name}' timed out after {timeout:.0f}s — the page or browser may be unresponsive]"
+
 
 PLAYWRIGHT_MCP_COMMAND = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
 # --isolated is required, not optional, given our design: @playwright/mcp defaults to a
@@ -86,8 +135,8 @@ async def open_playwright_session(stack: AsyncExitStack) -> list:
 async def get_accessibility_snapshot(tools: list, url: str) -> dict:
     """Navigate to `url` and return the page's accessibility tree snapshot."""
     tool_map = {tool.name: tool for tool in tools}
-    await tool_map["browser_navigate"].ainvoke({"url": url})
-    return await tool_map["browser_snapshot"].ainvoke({})
+    await invoke_tool(tool_map["browser_navigate"], {"url": url})
+    return await invoke_tool(tool_map["browser_snapshot"], {})
 
 
 def _coerce_text(result) -> str:
@@ -113,7 +162,7 @@ def _coerce_json_array(result) -> list[dict]:
 async def navigate(tools: list, url: str) -> None:
     """Navigate without snapshotting — reused by planner_explore.crawl_site's page visits."""
     tool_map = {tool.name: tool for tool in tools}
-    await tool_map["browser_navigate"].ainvoke({"url": url})
+    await invoke_tool(tool_map["browser_navigate"], {"url": url})
 
 
 async def shallow_snapshot(tools: list, *, depth: int) -> str:
@@ -124,13 +173,13 @@ async def shallow_snapshot(tools: list, *, depth: int) -> str:
     additionally hard-truncates the result by character count regardless, as a backstop.
     """
     tool_map = {tool.name: tool for tool in tools}
-    result = await tool_map["browser_snapshot"].ainvoke({"depth": depth})
+    result = await invoke_tool(tool_map["browser_snapshot"], {"depth": depth})
     return _coerce_text(result)
 
 
 async def get_page_title(tools: list) -> str:
     tool_map = {tool.name: tool for tool in tools}
-    result = await tool_map["browser_evaluate"].ainvoke({"function": "() => document.title"})
+    result = await invoke_tool(tool_map["browser_evaluate"], {"function": "() => document.title"})
     return _coerce_text(result).strip()
 
 
@@ -146,12 +195,13 @@ async def list_page_links(tools: list) -> list[dict]:
     this specific call has no mutation risk.
     """
     tool_map = {tool.name: tool for tool in tools}
-    result = await tool_map["browser_evaluate"].ainvoke(
+    result = await invoke_tool(
+        tool_map["browser_evaluate"],
         {
             "function": (
                 "() => Array.from(document.querySelectorAll('a[href]'))"
                 ".map(a => ({text: (a.innerText || a.textContent || '').trim().slice(0, 80), href: a.href}))"
             )
-        }
+        },
     )
     return _coerce_json_array(result)

@@ -29,6 +29,11 @@ type RunReport = {
     failed: number;
     blocked?: number;
     by_category?: Record<TestCategory, { total: number; passed: number; failed: number; blocked?: number }>;
+    // Feature -> Flow -> Scenario rollup (backend/nodes/reporter.py) — by_flow omitted
+    // here since this page doesn't otherwise join test_cases (feature_id/flow_id live
+    // there, not on TestResult) into its flat per-result list below; the feature-level
+    // pass/fail counts alone don't need that join.
+    by_feature?: Record<string, { name: string; description: string; total: number; passed: number; failed: number; blocked?: number }>;
   };
   test_results: TestResult[];
   plan_approved: boolean;
@@ -116,6 +121,27 @@ export default function ReportsPage() {
                     >
                       {CATEGORY_LABELS[category as TestCategory] ?? category}
                     </span>
+                    <div className="mt-2 text-sm text-slate-300">
+                      {counts.passed}/{counts.total} passed
+                      {counts.failed > 0 && <span className="text-rose-300"> · {counts.failed} failed</span>}
+                      {!!counts.blocked && counts.blocked > 0 && (
+                        <span className="text-amber-300"> · {counts.blocked} blocked</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {report.summary.by_feature && Object.keys(report.summary.by_feature).length > 0 && (
+            <section className="glass-panel rounded-3xl p-5 md:p-6">
+              <h2 className="mb-4 text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">By feature</h2>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                {Object.entries(report.summary.by_feature).map(([featureId, counts]) => (
+                  <div key={featureId} className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+                    <div className="text-sm font-semibold text-white">{counts.name}</div>
+                    {counts.description && <p className="mt-1 text-xs text-slate-400">{counts.description}</p>}
                     <div className="mt-2 text-sm text-slate-300">
                       {counts.passed}/{counts.total} passed
                       {counts.failed > 0 && <span className="text-rose-300"> · {counts.failed} failed</span>}

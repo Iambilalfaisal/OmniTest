@@ -4,6 +4,13 @@ while it is still running, not only once its `verdict_node` returns. Written fro
 inside nodes/worker/nodes.py's agent_node/tool_node/verdict_node (and graph/builder.py's
 route_to_workers, to pre-register every case as `queued` before any of them starts).
 
+Also tracks per-Feature recon progress (register_feature/update_feature/
+feature_snapshot, below) — without this, a run with RECON_ENABLED would go visibly
+dark for however long recon_node/recon_join_node take (nodes/recon/nodes.py's
+RECON_MAX_TURNS times however many Features), since route_to_workers' own
+pre-registration only happens AFTER that barrier — see graph/builder.py's route_to_recon
+and nodes/recon/nodes.py for the write sites.
+
 Same design precedent as core/llm_metrics.py and core/run_knowledge.py: a module-level
 dict keyed by run_id (== LangGraph's `thread_id`), single-process/single-event-loop
 (confirmed there — see those modules' own docstrings), so no new QAState channel/
@@ -85,5 +92,35 @@ def snapshot(run_id: str) -> dict[str, dict[str, Any]]:
     return _PROGRESS.get(run_id, {})
 
 
+FeaturePhase = Literal["exploring", "done"]
+
+_FEATURE_PROGRESS: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def register_feature(run_id: str, feature_id: str, *, name: str) -> None:
+    """Pre-registers `feature_id` as `exploring`, before its recon_node branch has
+    actually started — called once per Send payload from graph/builder.py's
+    route_to_recon, mirroring `register` above for test cases.
+    """
+    _FEATURE_PROGRESS.setdefault(run_id, {})[feature_id] = {
+        "name": name,
+        "phase": "exploring",
+        "scenario_count": 0,
+        "updated_at": time.time(),
+    }
+
+
+def update_feature(run_id: str, feature_id: str, **fields: Any) -> None:
+    bucket = _FEATURE_PROGRESS.setdefault(run_id, {})
+    entry = bucket.setdefault(feature_id, {"name": feature_id, "phase": "exploring", "scenario_count": 0})
+    entry.update(fields)
+    entry["updated_at"] = time.time()
+
+
+def feature_snapshot(run_id: str) -> dict[str, dict[str, Any]]:
+    return _FEATURE_PROGRESS.get(run_id, {})
+
+
 def discard(run_id: str) -> None:
     _PROGRESS.pop(run_id, None)
+    _FEATURE_PROGRESS.pop(run_id, None)

@@ -11,9 +11,12 @@ mutating action.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import Awaitable, Callable
+
+from ...mcp.client import invoke_tool
 
 EVIDENCE_DIR = Path(__file__).resolve().parent.parent.parent / "evidence"
 
@@ -76,7 +79,7 @@ async def start_capture(tool_map: dict, session_key: str) -> None:
         # steer the destination, it always lands under the MCP server's own default
         # working-directory location. stop_and_capture() below reflects this honestly
         # (returns None) rather than claiming a file exists where it can't.
-        await tool_map["browser_start_tracing"].ainvoke({})
+        await invoke_tool(tool_map["browser_start_tracing"], {})
 
 
 async def ensure_action_overlay(tool_map: dict, session_key: str) -> None:
@@ -102,7 +105,7 @@ async def ensure_action_overlay(tool_map: dict, session_key: str) -> None:
     if tool is None:
         return
     try:
-        await tool.ainvoke({})
+        await invoke_tool(tool, {})
         _action_overlay_enabled.add(session_key)
     except Exception:
         pass  # no open tab yet — the next mutation's attempt will retry
@@ -114,7 +117,7 @@ def discard_action_overlay(session_key: str) -> None:
 
 async def capture_screenshot(tool_map: dict, run_dir: Path) -> str:
     path = run_dir / "final.png"
-    await tool_map["browser_take_screenshot"].ainvoke({"filename": str(path)})
+    await invoke_tool(tool_map["browser_take_screenshot"], {"filename": str(path)})
     return str(path.relative_to(EVIDENCE_DIR.parent))
 
 
@@ -128,7 +131,7 @@ async def stop_and_capture(tool_map: dict, tool_name: str, path: Path) -> str | 
     tool = tool_map.get(tool_name)
     if tool is None:
         return None
-    await tool.ainvoke({})
+    await invoke_tool(tool, {})
     if not path.exists():
         return None
     return str(path.relative_to(EVIDENCE_DIR.parent))
@@ -176,16 +179,30 @@ async def capture_mutation_clip(
 
     run_dir.mkdir(parents=True, exist_ok=True)
     clip_path = run_dir / f"clip_{clip_index:03d}.webm"
-    await start_tool.ainvoke({"filename": str(clip_path)})
+    # Bounded and non-raising, unlike do_action() below: this runs directly inside
+    # tool_node with no enclosing try/except, and a raise here would crash the WHOLE
+    # run (see invoke_tool's docstring) over a video-recording failure, not even the
+    # actual test action. Degrades to "no clip for this action" instead — the same
+    # fallback this function already uses when the video tools aren't offered at all.
+    try:
+        await invoke_tool(start_tool, {"filename": str(clip_path)})
+    except Exception:
+        logging.exception("capture_mutation_clip: browser_start_video failed/timed out — proceeding without a clip")
+        return await do_action(), None
+
     await asyncio.sleep(ACTION_CLIP_PRE_SECONDS)
     try:
         result = await do_action()
     finally:
         # In `finally` so a raised action still yields a clip showing what led to it —
         # and so a stray in-progress recording never lingers past this function ready
-        # to collide with the NEXT mutation's browser_start_video call.
+        # to collide with the NEXT mutation's browser_start_video call. Same
+        # non-raising reasoning as browser_start_video above.
         await asyncio.sleep(ACTION_CLIP_POST_SECONDS)
-        await stop_tool.ainvoke({})
+        try:
+            await invoke_tool(stop_tool, {})
+        except Exception:
+            logging.exception("capture_mutation_clip: browser_stop_video failed/timed out")
 
     if not clip_path.exists():
         return result, None

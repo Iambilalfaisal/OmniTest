@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from .models import TestCase
+from .models import Feature, TestCase
 
 
 def generate_run_token() -> str:
@@ -80,3 +80,40 @@ def ensure_expected_result(test_cases: list[TestCase]) -> list[TestCase]:
         else:
             result.append(tc.model_copy(update={"expected_result": MISSING_EXPECTED_RESULT_NOTE}))
     return result
+
+
+DEFAULT_FEATURE_ID = "general"
+DEFAULT_FEATURE_NAME = "General"
+
+
+def ensure_features(features: list[Feature], test_cases: list[TestCase]) -> tuple[list[Feature], list[TestCase]]:
+    """Guarantees every TestCase.feature_id names a REAL Feature in the returned list —
+    the same class of structured-output gap ensure_expected_result exists for
+    (Field(...) with no enforced default across this codebase's Gemini structured-output
+    path — see that function's docstring for the confirmed mechanism). Two ways this can
+    drift: the model omits `features` entirely despite writing test cases fine, or it
+    tags a TestCase with a feature_id that doesn't match any Feature it declared.
+    graph/builder.py's route_to_recon Sends one recon instance per Feature and depends on
+    every referenced feature_id actually resolving — an orphaned feature_id there would
+    silently strand that TestCase out of any Feature/Flow grouping in the reporter and
+    frontend, not raise, so it's corrected here rather than trusted.
+
+    Synthesizes a single catch-all Feature (DEFAULT_FEATURE_ID) only when `features` is
+    empty; an individual case with an unrecognized feature_id is reassigned to whichever
+    Feature is first in the (real or synthesized) list, rather than inventing a Feature
+    per orphaned id — a model that got this far wrong across many cases is better served
+    by one predictable fallback grouping than several ad hoc ones.
+    """
+    if not features:
+        features = [
+            Feature(feature_id=DEFAULT_FEATURE_ID, name=DEFAULT_FEATURE_NAME, description="Ungrouped test cases.")
+        ]
+    known_ids = {f.feature_id for f in features}
+
+    fixed_cases = []
+    for tc in test_cases:
+        if tc.feature_id in known_ids:
+            fixed_cases.append(tc)
+        else:
+            fixed_cases.append(tc.model_copy(update={"feature_id": features[0].feature_id}))
+    return features, fixed_cases

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Awaitable, Callable
 
 from langchain_core.messages import ToolMessage
@@ -24,7 +25,31 @@ from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from ..mcp.client import invoke_tool_or_error_text
+
 ASK_HUMAN_TOOL_NAME = "ask_human"
+
+# Coarse per-leaf wall-clock backstop, checked once at the top of every agent_node/
+# auth_agent_node turn (not inside tool_node — every individual tool call is already
+# bounded by mcp.client.TOOL_CALL_TIMEOUT_SECONDS, so the risk this specifically guards
+# against is the SUM across many turns, not any single call: MAX_TOOL_TURNS_CEILING
+# already caps turn COUNT, but not turns-times-worst-case-latency, so a case that times
+# out on nearly every tool call could still occupy a slot for a very long time without
+# this). Deliberately generous relative to a normal test case's real duration — this is
+# a backstop for a leaf that is clearly not converging, not a performance target.
+SCENARIO_DEADLINE_SECONDS = float(os.getenv("SCENARIO_DEADLINE_SECONDS", "600"))
+
+
+def new_deadline() -> float:
+    """A fresh SCENARIO_DEADLINE_SECONDS window starting now — used both to set a
+    leaf's initial deadline on its first turn, and to push it forward after a genuine
+    human-in-the-loop pause (ask_human, risky-action review) resumes. A pause's
+    wall-clock gap is real human response time, not runaway execution — naively
+    continuing a pre-pause countdown would trip the deadline the instant a slow human
+    answers. Treating a resume as "you get a fresh window" mirrors the semantics
+    MAX_TOOL_TURNS_CEILING's earned extension already uses for turn_budget.
+    """
+    return time.monotonic() + SCENARIO_DEADLINE_SECONDS
 
 
 class AskHumanInput(BaseModel):
@@ -239,7 +264,11 @@ async def ask_human_and_reply(
     )
     answer_text = answer.get("text", "")
     tool_map = await get_tool_map()
-    fresh_snapshot = truncate_tool_result(str(await tool_map["browser_snapshot"].ainvoke({})))
+    # invoke_tool_or_error_text, not invoke_tool: this runs directly inside
+    # tool_node/auth_tool_node after a real interrupt()/resume, with no enclosing
+    # try/except — a raise here would crash the whole run (see invoke_tool's
+    # docstring), not just fail this one leaf's ask_human turn.
+    fresh_snapshot = truncate_tool_result(await invoke_tool_or_error_text(tool_map["browser_snapshot"], {}))
     reply = ToolMessage(
         content=(
             f"{answer_text}\n\n[Fresh snapshot taken after waiting for this answer — "

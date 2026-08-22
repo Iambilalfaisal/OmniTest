@@ -22,9 +22,37 @@ from enum import Enum
 # langchain-google-genai (not listed separately in requirements.txt), always present
 # alongside it since langchain_google_genai imports it directly itself.
 from google.genai.errors import APIError
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langgraph.types import RetryPolicy, default_retry_on
+
+# Wall-clock bound on a single LLM call (both providers accept this — confirmed against
+# the installed langchain-google-genai/langchain-openai: ChatGoogleGenerativeAI has a
+# `timeout` field, ChatOpenAI has `request_timeout`, both float seconds at the HTTP
+# client level). Before this, nothing bounded an LLM call that hangs rather than
+# erroring — max_retries only re-sends on a completed 429/5xx response.
+LLM_CALL_TIMEOUT_SECONDS = float(os.getenv("LLM_CALL_TIMEOUT_SECONDS", "60"))
+
+# Every LLM-calling role in this codebase (planner/worker/verdict/memory, all Gemini)
+# shares ONE global request ceiling — the actual gap the 429 handling above never
+# closed: node_retry_on/GEMINI_MAX_RETRIES react to a 429 AFTER it happens, but nothing
+# stopped N concurrent worker branches from all issuing their first call in the same
+# second in the first place. requests_per_second is derived from the account's real RPM
+# limit (see .env's own comment on MAX_CONCURRENT_WORKERS for how that number was
+# obtained) — a token bucket that every call awaits BEFORE sending makes a 429 from our
+# own request pattern structurally unreachable, rather than something to detect and
+# back off from after the fact. max_bucket_size defaults to MAX_CONCURRENT_WORKERS so a
+# burst of that many branches starting together can each fire once immediately, then
+# refill at the steady rate.
+LLM_REQUESTS_PER_SECOND = float(os.getenv("LLM_REQUESTS_PER_SECOND", "0.25"))
+LLM_MAX_BURST = float(os.getenv("LLM_MAX_BURST", os.getenv("MAX_CONCURRENT_WORKERS", "5")))
+
+_GEMINI_RATE_LIMITER = InMemoryRateLimiter(
+    requests_per_second=LLM_REQUESTS_PER_SECOND,
+    check_every_n_seconds=0.1,
+    max_bucket_size=LLM_MAX_BURST,
+)
 
 # Total HTTP attempts INCLUDING the original request (confirmed against the installed
 # langchain-google-genai: it builds `HttpRetryOptions(attempts=max_retries)` verbatim) —
@@ -73,6 +101,8 @@ def get_chat_model(role: ModelRole, *, temperature: float = 0.0, **kwargs) -> Ch
         model=_resolve_model_name(role),
         temperature=temperature,
         max_retries=GEMINI_MAX_RETRIES,
+        timeout=LLM_CALL_TIMEOUT_SECONDS,
+        rate_limiter=_GEMINI_RATE_LIMITER,
         **kwargs,
     )
 
@@ -139,11 +169,16 @@ def _build_fallback_model(role: ModelRole, *, temperature: float, **kwargs) -> C
     # OPENROUTER_API_KEY is only required once a fallback model is actually configured
     # AND the primary actually fails — checked here (not at import time) so a role with
     # no fallback configured never needs this var at all.
+    # No rate_limiter here: OpenRouter is a separate provider with its own, unrelated
+    # quota — sharing _GEMINI_RATE_LIMITER (calibrated to the Gemini account's RPM)
+    # would throttle it to an arbitrary, unrelated number. request_timeout is still
+    # applied — bounding a hang is a provider-agnostic concern, not a quota one.
     return ChatOpenAI(
         model=model_name,
         base_url=OPENROUTER_BASE_URL,
         api_key=os.environ["OPENROUTER_API_KEY"],
         temperature=temperature,
+        request_timeout=LLM_CALL_TIMEOUT_SECONDS,
         **kwargs,
     )
 

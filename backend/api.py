@@ -63,7 +63,7 @@ from .core.history import HistoryStore, make_history_store
 from .core.memory import make_store
 from .core.models import SiteMap, TestPlan
 from .core.run_context import run_id_var
-from .core.run_planning import ensure_expected_result, ensure_unique_test_ids
+from .core.run_planning import ensure_expected_result, ensure_features, ensure_unique_test_ids
 from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
@@ -405,6 +405,8 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
         "discovery_context": req.discovery_context,
         "run_token": "",
         "test_cases": [],
+        "features": [],
+        "flow_reports": [],
         "test_results": [],
         "summary": {},
         "plan_approved": False,
@@ -493,6 +495,13 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
                             "test_cases": [_model_dump(tc) for tc in snapshot.values.get("test_cases", [])],
                             "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
                             "plan_approved": snapshot.values.get("plan_approved", False),
+                            # Feature -> Flow -> Scenario hierarchy (nodes/recon/): each
+                            # test_case above already carries its own feature_id/flow_id/
+                            # origin/discovery_rationale, and summary.by_feature (reporter_node)
+                            # carries the aggregated rollup — this is just the raw Feature
+                            # list (name/description) for a header the frontend can render
+                            # without recomputing anything from the other two.
+                            "features": [_model_dump(f) for f in snapshot.values.get("features", [])],
                         }
                     ),
                 }
@@ -504,6 +513,7 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
                         {
                             "test_cases": [_model_dump(tc) for tc in snapshot.values.get("test_cases", [])],
                             "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
+                            "features": [_model_dump(f) for f in snapshot.values.get("features", [])],
                             # core/progress.py: per-test-case live detail (phase, step
                             # index, current action, turn/budget, deviation/ask counts)
                             # for whichever test cases are still queued/running/awaiting
@@ -512,6 +522,11 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
                             # out, since it's harmless and one less special case for the
                             # frontend to handle right at the queued->done transition.
                             "worker_progress": progress.snapshot(run_id),
+                            # Per-Feature recon status (exploring/done + how many scenarios
+                            # it produced) — the only live signal while recon_node/
+                            # recon_join_node run, since no test_case/worker_progress entry
+                            # exists yet for a scenario recon hasn't discovered.
+                            "feature_progress": progress.feature_snapshot(run_id),
                         }
                     ),
                 }
@@ -572,6 +587,7 @@ async def get_report(run_id: str, request: Request) -> dict:
         "test_cases": [_model_dump(tc) for tc in snapshot.values.get("test_cases", [])],
         "test_results": [_model_dump(r) for r in snapshot.values.get("test_results", [])],
         "plan_approved": snapshot.values.get("plan_approved", False),
+        "features": [_model_dump(f) for f in snapshot.values.get("features", [])],
     }
 
 
@@ -668,8 +684,11 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
 
         candidate_plan: TestPlan = snapshot.values["candidate_plan"]
         # ensure_expected_result: discovery_agent_node already backfills this every turn,
-        # this is defense in depth for the handoff into an actual run.
+        # this is defense in depth for the handoff into an actual run. ensure_features
+        # is genuinely NEW defense here — discovery_agent_node does not yet backfill it
+        # itself, unlike expected_result.
         test_cases = ensure_expected_result(ensure_unique_test_ids(candidate_plan.test_cases))
+        features, test_cases = ensure_features(candidate_plan.features, test_cases)
         instruction = snapshot.values.get("starting_idea") or "(test plan authored via discovery chat)"
 
         # CONFIRMED live: this used to be hardcoded to "" here, so any credentials the
@@ -694,6 +713,8 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
             "discovery_context": discovery_context,
             "run_token": snapshot.values.get("run_token", ""),
             "test_cases": test_cases,
+            "features": features,
+            "flow_reports": [],
             "test_results": [],
             "summary": {},
             "plan_approved": True,
