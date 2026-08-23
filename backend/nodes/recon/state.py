@@ -13,7 +13,7 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
-from ...core.models import Feature, FlowReport
+from ...core.models import Feature, FlowReport, TestCase
 
 
 class ReconState(TypedDict):
@@ -21,6 +21,20 @@ class ReconState(TypedDict):
     run_token: str
     discovery_context: str  # credentials/preferences from a prior discovery chat; "" if none.
     feature: Feature  # which Feature this instance explores — set once in the Send payload.
+    # The baseline planner's/discovery chat's test cases already covering this SAME
+    # feature_id (graph/builder.py's route_to_recon filters QAState.test_cases down to
+    # just this feature before the Send) — set once in the Send payload, read only by
+    # recon_plan_node. Without this, recon's synthesis call has no way to know a scenario
+    # it's about to propose already exists under the baseline plan, since nothing else in
+    # this subgraph's context (the exploration transcript) mentions the baseline at all.
+    existing_test_cases: list[TestCase]
+    # Path to the shared login's storage-state file (set once by auth_setup_node,
+    # nodes/auth/nodes.py), or None if no baseline test case in this run required auth —
+    # set once in the Send payload. Without this, recon explores every feature LOGGED
+    # OUT even when a shared login already exists, so a feature that requires being
+    # logged in to reach (e.g. an account/agent-management area) hits a login wall
+    # immediately and recon reports the whole feature blocked, discovering nothing.
+    auth_storage_state: str | None
     messages: Annotated[list[AnyMessage], add_messages]
     pending_tool_calls: list[dict]
     turn_count: int

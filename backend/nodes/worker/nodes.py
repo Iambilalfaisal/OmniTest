@@ -10,6 +10,7 @@ would replay every earlier turn's tool calls.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -754,6 +755,21 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         logging.exception("verdict_node: failed to capture the final page snapshot for %s", key)
         final_snapshot = "[final snapshot unavailable — the browser did not respond in time]"
 
+    # Only for a case that named a genuinely visual claim (core/models.py's
+    # visual_assertion) — the accessibility tree above is text, and can't show layout,
+    # overlap, color, or whether a chart/canvas actually rendered. Best-effort: a failure
+    # here degrades to text-only grading (still correct for anything the tree DOES show)
+    # rather than losing the verdict entirely.
+    visual_evidence_b64 = None
+    if test_case.visual_assertion:
+        try:
+            visual_run_dir = run_dir_for(key)
+            visual_run_dir.mkdir(parents=True, exist_ok=True)
+            await capture_screenshot(tool_map, visual_run_dir)
+            visual_evidence_b64 = base64.b64encode((visual_run_dir / "final.png").read_bytes()).decode("ascii")
+        except Exception:
+            logging.exception("verdict_node: failed to capture the visual-assertion screenshot for %s", key)
+
     # Found directly from a live run: a test case that spent most of its turn budget on
     # an unplanned signup detour, then hit the budget with the actual goal (typing
     # and submitting an agent description) never attempted — the final page was
@@ -791,38 +807,51 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         else ""
     )
 
-    model = with_fallback(ModelRole.VERDICT, lambda m: m.with_structured_output(Verdict), temperature=0)
-    verdict: Verdict = await model.ainvoke(
-        compact_history(state["messages"])
-        + [
-            HumanMessage(
-                f"Here is the ACTUAL page state right now, captured fresh for this verdict — trust this over "
-                f"anything you remember from earlier in the conversation if they seem to disagree:\n{final_snapshot}\n\n"
-                "You are now the QA reviewer grading this test case. You are grading ONE claim, not the site "
-                "in general:\n"
-                f"Goal: {test_case.goal}\n"
-                f"Category: {test_case.category} — {_category_note(test_case.category)}\n"
-                f"Expected result (the ONLY criterion; grade against this, not against your own idea of what "
-                f"should have happened): {_expected_result(test_case)}\n\n"
-                "How to decide:\n"
-                "- Pass ONLY if the fresh page state above, or a tool result you can actually point to in this "
-                "conversation, shows the expected result. Name that evidence in your reason.\n"
-                "- Fail if you cannot point to such evidence, if the run never got far enough to produce it, or "
-                "if something else happened instead.\n"
-                "- Reaching the right page, an absence of visible errors, or a flow that 'should' work is NOT "
-                "evidence of success.\n"
-                "- On a negative test case the expected result IS a rejection: the site showing that error is a "
-                "PASS, and the site accepting the invalid input is a FAIL.\n"
-                "- Grade BLOCKED, not Fail, ONLY when the transcript shows a specific, named external wall "
-                "stopped the run before it could reach the expected result — a CAPTCHA, an OTP/email/SMS "
-                "verification step, a paywall, or a required credential nobody supplied — or the budget note "
-                "below tells you to. Name that exact wall in your reason.\n"
-                "- A tool error, a crashed step, or any other unrelated blocker that ISN'T one of those named "
-                "walls is a FAIL — say so plainly rather than grading the site's behavior you never got to "
-                f"observe.{budget_note}"
-            )
-        ]
+    verdict_text = (
+        f"Here is the ACTUAL page state right now, captured fresh for this verdict — trust this over "
+        f"anything you remember from earlier in the conversation if they seem to disagree:\n{final_snapshot}\n\n"
+        "You are now the QA reviewer grading this test case. You are grading ONE claim, not the site "
+        "in general:\n"
+        f"Goal: {test_case.goal}\n"
+        f"Category: {test_case.category} — {_category_note(test_case.category)}\n"
+        f"Expected result (the ONLY criterion; grade against this, not against your own idea of what "
+        f"should have happened): {_expected_result(test_case)}\n\n"
+        "How to decide:\n"
+        "- Pass ONLY if the fresh page state above, or a tool result you can actually point to in this "
+        "conversation, shows the expected result. Name that evidence in your reason.\n"
+        "- Fail if you cannot point to such evidence, if the run never got far enough to produce it, or "
+        "if something else happened instead.\n"
+        "- Reaching the right page, an absence of visible errors, or a flow that 'should' work is NOT "
+        "evidence of success.\n"
+        "- On a negative test case the expected result IS a rejection: the site showing that error is a "
+        "PASS, and the site accepting the invalid input is a FAIL.\n"
+        "- Grade BLOCKED, not Fail, ONLY when the transcript shows a specific, named external wall "
+        "stopped the run before it could reach the expected result — a CAPTCHA, an OTP/email/SMS "
+        "verification step, a paywall, or a required credential nobody supplied — or the budget note "
+        "below tells you to. Name that exact wall in your reason.\n"
+        "- A tool error, a crashed step, or any other unrelated blocker that ISN'T one of those named "
+        "walls is a FAIL — say so plainly rather than grading the site's behavior you never got to "
+        f"observe.{budget_note}"
     )
+    # List content (text block + image_url block) only when there's actually an image —
+    # confirmed against the installed langchain_google_genai's own accepted shape
+    # (chat_models.py). Plain string otherwise, unchanged from before this field existed.
+    verdict_content = verdict_text
+    if visual_evidence_b64:
+        verdict_content = [
+            {
+                "type": "text",
+                "text": verdict_text + "\n\nA screenshot of this exact final page state is attached below — this "
+                "case was flagged as needing a visual check specifically because its expected result names "
+                "something the accessibility tree above can't show (layout, overlap, color, or whether "
+                "something actually rendered). Weigh the screenshot for that, not for anything the tree "
+                "already told you.",
+            },
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{visual_evidence_b64}"}},
+        ]
+
+    model = with_fallback(ModelRole.VERDICT, lambda m: m.with_structured_output(Verdict), temperature=0)
+    verdict: Verdict = await model.ainvoke(compact_history(state["messages"]) + [HumanMessage(content=verdict_content)])
 
     # Evidence capture + teardown, wrapped in one try/except/finally so NOTHING in this
     # block can escape verdict_node and trigger a node-level retry. Before this fix, a

@@ -33,11 +33,13 @@ import time
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
 from ...core import progress
 from ...core.llm import LLM_RETRY_POLICY, ModelRole, with_fallback
-from ...core.models import TEST_CASE_AUTHORING_GUIDELINES, FlowReport
+from ...core.memory import retrieve_memory_context
+from ...core.models import TEST_CASE_AUTHORING_GUIDELINES, FlowReport, TestCase
 from ...core.run_context import run_id_var
 from ...mcp.client import invoke_tool, invoke_tool_or_error_text
 from ..agent_loop import (
@@ -179,10 +181,21 @@ def _to_flow_reports(feature_id: str, output: ReconOutput) -> list[FlowReport]:
     reports = []
     for i, flow in enumerate(output.flows):
         flow_id = f"{feature_id}-flow-{i + 1}"
-        # Truncate by rank (ascending — lower is more important), not arbitrarily —
-        # see SCENARIOS_PER_FEATURE_MAX's own comment for why this per-flow cap is
-        # separate from the run-wide one applied later in graph/builder.py.
-        ranked = sorted(flow.scenarios, key=lambda s: s.rank)[:SCENARIOS_PER_FEATURE_MAX]
+        # getattr, not direct attribute access, on every field below: ScenarioProposalOut's
+        # required fields (expected_result, steps, goal, rank) sit behind the SAME Gemini
+        # .with_structured_output() path core/run_planning.py already confirmed can omit a
+        # required field entirely (built via model_construct(), so the attribute doesn't
+        # exist at all) rather than raise — a direct s.expected_result here would surface
+        # that as an uncaught AttributeError inside recon_plan_node, which (per this
+        # codebase's own confirmed langgraph behavior) crashes the WHOLE run, not just this
+        # one Feature's recon. expected_result falls back to "" (a valid str, unlike None)
+        # rather than a descriptive placeholder here — recon_join_node's
+        # ensure_expected_result (graph/builder.py) is what actually backfills the real
+        # placeholder note, once this is a TestCase; here it only needs to not crash
+        # constructing FlowReport/ScenarioProposal.
+        ranked = sorted(
+            flow.scenarios, key=lambda s: getattr(s, "rank", None) if getattr(s, "rank", None) is not None else 999
+        )[:SCENARIOS_PER_FEATURE_MAX]
         reports.append(
             FlowReport(
                 feature_id=feature_id,
@@ -193,13 +206,13 @@ def _to_flow_reports(feature_id: str, output: ReconOutput) -> list[FlowReport]:
                 blocked_by=flow.blocked_by,
                 scenarios=[
                     {
-                        "goal": s.goal,
-                        "category": s.category,
-                        "priority": s.priority,
-                        "rationale": s.rationale,
-                        "rank": s.rank,
-                        "expected_result": s.expected_result,
-                        "steps": s.steps,
+                        "goal": getattr(s, "goal", None) or "(recon did not specify a goal for this scenario)",
+                        "category": getattr(s, "category", None) or "edge_case",
+                        "priority": getattr(s, "priority", None) or "medium",
+                        "rationale": getattr(s, "rationale", None) or "",
+                        "rank": getattr(s, "rank", None) if getattr(s, "rank", None) is not None else 999,
+                        "expected_result": getattr(s, "expected_result", None) or "",
+                        "steps": getattr(s, "steps", None) or [],
                     }
                     for s in ranked
                 ],
@@ -208,7 +221,7 @@ def _to_flow_reports(feature_id: str, output: ReconOutput) -> list[FlowReport]:
     return reports
 
 
-async def recon_agent_node(state: ReconState, config: RunnableConfig) -> dict:
+async def recon_agent_node(state: ReconState, config: RunnableConfig, *, store: BaseStore | None = None) -> dict:
     feature = state["feature"]
 
     # Wall-clock backstop (agent_loop.SCENARIO_DEADLINE_SECONDS) — mirrors
@@ -232,6 +245,24 @@ async def recon_agent_node(state: ReconState, config: RunnableConfig) -> dict:
     history = state.get("messages")
     seed: list = []
     if not history:
+        # Mirrors agent_node's own ordering (nodes/worker/nodes.py): must land BEFORE
+        # browser_navigate below, since a storage-state restore only affects requests
+        # made after it, not anything the browser already loaded. Unconditional on
+        # auth_storage_state alone (no per-Feature requires_auth to gate on, unlike
+        # agent_node) — see ReconState's own comment for the login-wall failure mode
+        # this avoids. Best-effort: a failure here still lets recon explore, just
+        # logged out, same degradation agent_node accepts for the same failure.
+        auth_state = state.get("auth_storage_state")
+        set_storage_state_tool = tool_map.get("browser_set_storage_state")
+        if auth_state and set_storage_state_tool is not None:
+            try:
+                await invoke_tool(set_storage_state_tool, {"filename": auth_state})
+            except Exception:
+                logging.exception(
+                    "recon_agent_node: failed to inject shared auth storage state for %s — "
+                    "exploring unauthenticated",
+                    feature.feature_id,
+                )
         try:
             await invoke_tool(tool_map["browser_navigate"], {"url": state["target_url"]})
         except Exception:
@@ -239,6 +270,14 @@ async def recon_agent_node(state: ReconState, config: RunnableConfig) -> dict:
             discard_session(key)
             return {"pending_tool_calls": [], "abort_reason": "failed to navigate to the target URL"}
 
+        # Same store planner_node/discovery_agent_node already query before drafting a
+        # plan (core/memory.py's retrieve_memory_context) — without this, recon explored
+        # this exact feature with zero awareness of what an EARLIER run already learned
+        # about it (a validation rule's exact wording, a verification step that blocks
+        # further progress), and would waste turns rediscovering the same wall from
+        # scratch every time. Queried once per Feature instance, not per turn, matching
+        # discovery_agent_node's own "only on the first turn" placement.
+        memory_context = await retrieve_memory_context(state["target_url"], f"{feature.name} {feature.description}", store)
         seed = [
             SystemMessage(
                 RECON_SYSTEM_PROMPT.format(feature_name=feature.name, feature_description=feature.description)
@@ -246,7 +285,8 @@ async def recon_agent_node(state: ReconState, config: RunnableConfig) -> dict:
             HumanMessage(
                 f"Target URL: {state['target_url']}\n"
                 f"Known context (existing credentials/preferences, if any): "
-                f"{state.get('discovery_context') or 'None provided.'}"
+                f"{state.get('discovery_context') or 'None provided.'}\n"
+                f"Prior learnings about this site (from previous runs):\n{memory_context}"
             ),
         ]
         history = seed
@@ -316,6 +356,12 @@ async def recon_tool_node(state: ReconState, config: RunnableConfig) -> dict:
     }
 
 
+def _format_existing_scenarios(existing: list[TestCase]) -> str:
+    if not existing:
+        return "(none — this is the first coverage proposed for this feature)"
+    return "\n".join(f"- ({tc.category}) {tc.goal}" for tc in existing)
+
+
 async def recon_plan_node(state: ReconState, config: RunnableConfig) -> dict:
     feature = state["feature"]
     key = _session_key(config, feature.feature_id)
@@ -351,7 +397,11 @@ async def recon_plan_node(state: ReconState, config: RunnableConfig) -> dict:
         compact_history(state["messages"])
         + [
             HumanMessage(
-                RECON_PLAN_PROMPT.format(feature_name=feature.name, run_token=state.get("run_token", ""))
+                "Test cases already planned for this feature before you explored it — never propose one "
+                "that restates any of these (same behavior under test, just reworded); only propose "
+                "scenarios that add flows or conditions NONE of these already cover:\n"
+                f"{_format_existing_scenarios(state.get('existing_test_cases', []))}\n\n"
+                + RECON_PLAN_PROMPT.format(feature_name=feature.name, run_token=state.get("run_token", ""))
             )
         ]
     )

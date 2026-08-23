@@ -13,6 +13,7 @@ from langgraph.types import Send, interrupt
 from ..core import progress
 from ..core.llm import LLM_RETRY_POLICY
 from ..core.models import FlowReport, ScenarioProposal, TestCase
+from ..core.run_planning import ensure_expected_result
 from ..core.state import QAState
 from ..nodes.auth import build_auth_subgraph
 from ..nodes.memory import memory_node
@@ -78,6 +79,8 @@ def route_to_recon(state: QAState, config: RunnableConfig):
     run_id = config["configurable"]["thread_id"]
     for feature in state["features"]:
         progress.register_feature(run_id, feature.feature_id, name=feature.name)
+    baseline_cases = state.get("test_cases", [])
+    auth_state = state.get("auth_storage_state")
     return [
         Send(
             "recon_node",
@@ -86,6 +89,14 @@ def route_to_recon(state: QAState, config: RunnableConfig):
                 "run_token": state["run_token"],
                 "discovery_context": state.get("discovery_context", ""),
                 "feature": feature,
+                # Filtered to THIS Feature — see nodes/recon/state.py's ReconState.existing_test_cases
+                # for why recon's synthesis step needs this to avoid restating baseline coverage.
+                "existing_test_cases": [tc for tc in baseline_cases if tc.feature_id == feature.feature_id],
+                # Unconditional (unlike route_to_workers' per-test-case requires_auth gate) —
+                # recon has no per-Feature requires_auth concept, and exploring already
+                # logged in never hurts a flow that doesn't need auth. See ReconState's
+                # own comment for the login-wall failure mode this avoids.
+                "auth_storage_state": auth_state,
             },
         )
         for feature in state["features"]
@@ -146,7 +157,12 @@ def recon_join_node(state: QAState) -> dict:
         accepted.append(_test_case_from_scenario(flow, scenario, i))
         by_flow_index[flow.flow_id] = i + 1
 
-    return {"test_cases": accepted}
+    # Same backstop api.py/planner.py already apply to a baseline plan's TestCases
+    # (core/run_planning.py's own docstring: Gemini's structured output can silently
+    # omit a required field, confirmed live) — recon-discovered cases sit behind the
+    # SAME kind of structured-output call (nodes/recon/nodes.py's ScenarioProposalOut)
+    # and had never gotten this applied before now.
+    return {"test_cases": ensure_expected_result(accepted)}
 
 
 def route_to_workers(state: QAState, config: RunnableConfig):

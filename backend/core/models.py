@@ -116,6 +116,11 @@ step navigate to it explicitly.
   for a human reviewing the plan (e.g. "Runs already authenticated as the shared test
   account", "Signs up a new unique test account"). The worker never reads this — it only
   executes steps — so any setup a case genuinely needs must ALSO appear inline in steps.
+- visual_assertion: true ONLY if expected_result can't be judged from element text/labels
+  alone — layout/position, overlap, color, or whether a chart/canvas/image actually
+  rendered. Leave false (the default) for anything a screen reader could also tell apart:
+  a message, a URL, an element appearing or disappearing. Sparingly — only when a real
+  visual claim is the whole point of the case.
 
 ## 4. Coverage checklist by flow type
 
@@ -265,6 +270,9 @@ Example C — an edge case with a concrete, checkable empty state:
 Go through every test case you wrote and confirm all of these. Fix any that fail.
 - Does expected_result name something concretely observable on the final screen?
 - Does the case prove exactly one thing, in 6 steps or fewer?
+- Is every case's (goal, steps) pair genuinely distinct from every other case's? If two
+  entries would read as the same scenario under different wording, or the same flow got
+  written up once per feature it touches, that is one case duplicated — keep only one.
 - Is every element label one you actually saw in the accessibility tree or site map?
 - Does every value the worker must type appear literally, in quotes, in a step?
 - Is requires_auth false for every case that is itself testing signup/login/logout/reset?
@@ -365,6 +373,24 @@ class TestCase(BaseModel):
         "— None (the default, and every planner-origin case) means fully independent and safe to run in "
         "parallel like every other case. Only set this when the dependency is a genuinely observed one, "
         "never a guess — the ordinary rule remains 'no shared state between test cases'.",
+    )
+    # verdict_node (nodes/worker/nodes.py) grades every case off the accessibility-tree
+    # text snapshot alone by default — fast, and sufficient for anything a screen reader
+    # could also tell apart. Purely visual regressions (an element pushed off-screen by a
+    # CSS change, a chart/canvas that silently failed to render, two elements overlapping)
+    # produce no accessibility-tree difference at all, so a case whose expected_result
+    # depends on one of those is ungradeable without actually looking at the page. Kept
+    # opt-in, not default-on, for the same reason SCENARIOS_PER_FEATURE_MAX etc. are
+    # budget-gated: an attached image costs meaningfully more tokens than the text
+    # snapshot it doesn't replace, against this project's already-tight Gemini RPM/RPD
+    # quota (core/llm.py).
+    visual_assertion: bool = Field(
+        default=False,
+        description="True only if expected_result names something that can ONLY be judged by actually "
+        "looking at the rendered page — layout/position, overlap, color, or whether a chart/canvas/image "
+        "rendered — never set this for anything the accessibility tree text already shows (a message, a "
+        "URL, an element's presence/absence). When true, verdict_node attaches a real screenshot to the "
+        "grading call instead of relying on the text snapshot alone.",
     )
 
 
