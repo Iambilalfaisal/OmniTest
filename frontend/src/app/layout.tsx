@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
-import SidebarNav from "@/components/SidebarNav";
+import SidebarShell from "@/components/SidebarShell";
 import OrbitMark from "@/components/OrbitMark";
 
 export const metadata: Metadata = {
@@ -14,9 +14,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body className="min-h-screen text-slate-100 antialiased">
         <div className="flex min-h-screen">
-          <aside className="glass-panel sticky top-0 hidden h-screen w-72 shrink-0 rounded-none border-b-0 border-l-0 border-t-0 md:flex md:flex-col">
-            <SidebarNav />
-          </aside>
+          <SidebarShell />
 
           <div className="flex min-h-screen flex-1 flex-col">
             {/* Mobile top bar — the sidebar takes over from md: up */}

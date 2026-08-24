@@ -61,7 +61,7 @@ from .core import llm_metrics, progress, run_knowledge
 from .core.discovery_state import DiscoveryState
 from .core.history import HistoryStore, make_history_store
 from .core.memory import drop_semantic_duplicates, make_store
-from .core.models import SiteMap, TestPlan
+from .core.models import SiteMap, TestCase, TestPlan
 from .core.run_context import run_id_var
 from .core.run_planning import drop_duplicate_scenarios, ensure_expected_result, ensure_features, ensure_unique_test_ids
 from .core.state import QAState
@@ -191,6 +191,10 @@ class RunRequest(BaseModel):
     target_url: str
     instruction: str
     discovery_context: str = ""
+    # "My own plan" mode — when non-empty, the supplied test cases are used directly
+    # and planning/review nodes are skipped (plan_approved is forced True).
+    test_cases: list[dict] = []
+    features: list[dict] = []
 
 
 class RunHandle(BaseModel):
@@ -399,17 +403,33 @@ def _discovery_transcript(messages) -> list[dict]:
 @app.post("/runs", response_model=RunHandle)
 async def start_run(req: RunRequest, request: Request) -> RunHandle:
     run_id = str(uuid.uuid4())
+
+    # "My own plan" mode: caller supplied pre-written test cases — deserialise them,
+    # apply the same normalisation pipeline as the discovery-approve handler, then
+    # set plan_approved=True so route_entry skips planner_node + plan_review_node.
+    user_test_cases: list[TestCase] = []
+    user_features = []
+    plan_approved = False
+    if req.test_cases:
+        try:
+            raw = [TestCase(**tc) for tc in req.test_cases]
+            raw = ensure_expected_result(ensure_unique_test_ids(raw))
+            user_features, user_test_cases = ensure_features(req.features or [], raw)
+            plan_approved = True
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid test_cases payload: {exc}") from exc
+
     initial_state: QAState = {
         "target_url": req.target_url,
         "instruction": req.instruction,
         "discovery_context": req.discovery_context,
         "run_token": "",
-        "test_cases": [],
-        "features": [],
+        "test_cases": user_test_cases,
+        "features": user_features,
         "flow_reports": [],
         "test_results": [],
         "summary": {},
-        "plan_approved": False,
+        "plan_approved": plan_approved,
         "auth_storage_state": None,
     }
     # Insert BEFORE firing _drive() so a client hitting GET /history immediately after
