@@ -102,10 +102,15 @@ multi-step flow, or any other visible variation. Click far enough into each one 
 any real validation/error text — you do NOT need to complete any flow end to end.
 3. Deliberately trigger at least one validation error where practical (submit a required field empty, or \
 type an obviously invalid value) so you can report the SITE'S OWN real error wording, not a guess at it.
-4. Note every distinct field label, button, and validation message you actually saw, and note plainly \
+4. Before guessing a field's rule by typing values and seeing what gets rejected, check its real HTML \
+attributes directly with `browser_evaluate` (`required`, `minlength`, `maxlength`, `pattern`, `type="email"`, \
+`disabled`) — this gives you the EXACT rule the frontend enforces in one call, more precisely than trial and \
+error, and a literal rule worth quoting in your report. Still trigger the error live too (step 3) — an \
+attribute tells you the rule exists, not what the site's actual error message says.
+5. Note every distinct field label, button, and validation message you actually saw, and note plainly \
 anything that stopped you going further (a CAPTCHA, an OTP/email verification step, a paywall, a required \
 invite code you don't have) — never guess what is behind something you couldn't get past.
-5. You do not need to finish signing up, logging in, or submitting anything for real — reaching far enough \
+6. You do not need to finish signing up, logging in, or submitting anything for real — reaching far enough \
 to SEE what a flow needs is the goal, not completing it. Never delete, purchase, or pay for anything.
 
 If you hit something you cannot safely finish exploring on your own — a secret you were not given, a real \
@@ -132,7 +137,11 @@ RECON_PLAN_PROMPT = (
 
 class ScenarioProposalOut(BaseModel):
     goal: str = Field(description="Same contract as TestCase.goal — one sentence, '<action> should <outcome>'.")
-    category: str = Field(description="One of: happy_path, edge_case, negative, error_handling.")
+    category: str = Field(
+        description="One of: happy_path, edge_case, negative, error_handling, security, state_interaction "
+        "— see TEST_CASE_AUTHORING_GUIDELINES below for what each means. security/state_interaction only "
+        "for a field/control you actually observed to be free-text-echoing or stateful, respectively."
+    )
     priority: str = Field(default="medium", description="One of: high, medium, low.")
     rationale: str = Field(
         description="Why this scenario matters for THIS application specifically, grounded in what was "
@@ -154,7 +163,12 @@ class ScenarioProposalOut(BaseModel):
 class FlowReportOut(BaseModel):
     flow_name: str = Field(description="Human-readable name for this specific flow, e.g. 'Google OAuth'.")
     observed_fields: list[str] = Field(default_factory=list)
-    observed_validation: list[str] = Field(default_factory=list)
+    observed_validation: list[str] = Field(
+        default_factory=list,
+        description="Real validation rules for this flow — both a triggered error's exact wording AND a "
+        "rule read directly off an HTML attribute (e.g. 'password field has minlength=8', 'email field has "
+        "type=\"email\"'). Attribute-derived rules are exact even without triggering the error live.",
+    )
     blocked_by: str | None = Field(default=None)
     scenarios: list[ScenarioProposalOut] = Field(default_factory=list)
 

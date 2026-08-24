@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import TraceViewer from "@/components/TraceViewer";
 import { CATEGORY_LABELS, CATEGORY_STYLES, ClipSequencePlayer, TestCategory } from "@/components/WorkerCard";
 
@@ -40,28 +41,38 @@ type RunReport = {
 };
 
 export default function ReportsPage() {
-  const [runId, setRunId] = useState("");
+  const searchParams = useSearchParams();
+  const [runId, setRunId] = useState(searchParams.get("id") ?? "");
   const [report, setReport] = useState<RunReport | null>(null);
   const [activeTrace, setActiveTrace] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function loadReport(e: FormEvent) {
-    e.preventDefault();
+  async function loadReportById(id: string) {
+    if (!id.trim()) return;
     setLoading(true);
     setError(null);
-
     try {
-      const res = await fetch(`${API_BASE}/runs/${runId}/report`);
-      if (!res.ok) {
-        throw new Error("Unable to load report for this run.");
-      }
+      const res = await fetch(`${API_BASE}/runs/${id.trim()}/report`);
+      if (!res.ok) throw new Error("Unable to load report for this run.");
       setReport(await res.json());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
       setLoading(false);
     }
+  }
+
+  // Auto-load when navigated here with ?id=
+  useEffect(() => {
+    const id = searchParams.get("id");
+    if (id) loadReportById(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadReport(e: FormEvent) {
+    e.preventDefault();
+    await loadReportById(runId);
   }
 
   return (

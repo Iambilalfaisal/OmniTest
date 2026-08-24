@@ -19,6 +19,7 @@ export default function DiscoveryChat() {
   const [status, setStatus] = useState<DiscoveryStatus>("in_progress");
   const [turnCount, setTurnCount] = useState(0);
   const [maxTurns, setMaxTurns] = useState(20);
+  const [sitePages, setSitePages] = useState(0);
   const [loading, setLoading] = useState(true);
   const [reply, setReply] = useState("");
   const [sending, setSending] = useState(false);
@@ -42,6 +43,7 @@ export default function DiscoveryChat() {
         setStatus(data.status ?? "in_progress");
         setTurnCount(data.turn_count ?? 0);
         setMaxTurns(data.max_turns ?? 20);
+        setSitePages(data.site_pages_explored ?? 0);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "Something went wrong.");
       } finally {
@@ -157,9 +159,17 @@ export default function DiscoveryChat() {
             <p className="eyebrow">Discovery session / Live</p>
             <h1 className="mt-2 text-2xl font-semibold text-white">{targetUrl}</h1>
           </div>
-          <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
-            Turn {turnCount}/{maxTurns}
-          </span>
+          <div className="flex items-center gap-4">
+            {sitePages > 0 && (
+              <span className="flex items-center gap-1.5 rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1 text-xs font-medium text-fuchsia-300">
+                <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-400" />
+                {sitePages} page{sitePages !== 1 ? "s" : ""} explored
+              </span>
+            )}
+            <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
+              Turn {turnCount}/{maxTurns}
+            </span>
+          </div>
         </div>
       </header>
 

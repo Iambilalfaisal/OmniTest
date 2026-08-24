@@ -89,6 +89,7 @@ export default function HistoryDashboard() {
   const [stats, setStats] = useState<HistoryStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
 
   // Debounce the URL search box so every keystroke doesn't refetch.
   useEffect(() => {
@@ -173,6 +174,17 @@ export default function HistoryDashboard() {
 
   function goTo(item: HistorySession) {
     router.push(item.kind === "discovery" ? `/discover?id=${item.id}` : `/run?id=${item.id}`);
+  }
+
+  async function retrySession(id: string) {
+    setRetryingId(id);
+    try {
+      const res = await fetch(`${API_BASE}/runs/${id}/retry`, { method: "POST" });
+      if (!res.ok) throw new Error("Retry failed.");
+      router.push(`/run?id=${id}`);
+    } catch {
+      setRetryingId(null);
+    }
   }
 
   const trendDays = stats ? fillDailyTrend(stats.trend, since, until) : [];
@@ -269,11 +281,13 @@ export default function HistoryDashboard() {
         ) : (
           <div className="divide-y divide-white/5">
             {items.map((item) => (
-              <button
+              <div
                 key={item.id}
-                type="button"
+                role="button"
+                tabIndex={0}
                 onClick={() => goTo(item)}
-                className="flex w-full flex-col gap-2 px-3 py-3 text-left transition hover:bg-white/5 sm:flex-row sm:items-center sm:justify-between"
+                onKeyDown={(e) => e.key === "Enter" && goTo(item)}
+                className="flex w-full cursor-pointer flex-col gap-2 px-3 py-3 text-left transition hover:bg-white/5 sm:flex-row sm:items-center sm:justify-between"
               >
                 <div className="flex min-w-0 items-center gap-3">
                   <span
@@ -309,8 +323,29 @@ export default function HistoryDashboard() {
                     {SESSION_STATUS_LABELS[item.status] ?? item.status}
                   </span>
                   <span title={item.created_at}>{timeAgo(item.created_at)}</span>
+
+                  {/* Action buttons — stop propagation so they don't trigger the row click */}
+                  {item.kind === "run" && item.status === "error" && (
+                    <button
+                      type="button"
+                      disabled={retryingId === item.id}
+                      onClick={(e) => { e.stopPropagation(); retrySession(item.id); }}
+                      className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2.5 py-0.5 text-[10px] font-semibold text-rose-300 transition disabled:opacity-60 hover:border-rose-400/50"
+                    >
+                      {retryingId === item.id ? "Retrying…" : "Retry"}
+                    </button>
+                  )}
+                  {item.kind === "run" && item.status === "done" && (
+                    <a
+                      href={`/reports?id=${item.id}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2.5 py-0.5 text-[10px] font-semibold text-violet-300 transition hover:border-violet-400/50"
+                    >
+                      Report
+                    </a>
+                  )}
                 </div>
-              </button>
+              </div>
             ))}
           </div>
         )}

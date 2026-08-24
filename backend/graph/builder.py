@@ -12,6 +12,7 @@ from langgraph.types import Send, interrupt
 
 from ..core import progress
 from ..core.llm import LLM_RETRY_POLICY
+from ..core.memory import drop_semantic_duplicates
 from ..core.models import FlowReport, ScenarioProposal, TestCase
 from ..core.run_planning import ensure_expected_result
 from ..core.state import QAState
@@ -79,6 +80,20 @@ def route_to_recon(state: QAState, config: RunnableConfig):
     run_id = config["configurable"]["thread_id"]
     for feature in state["features"]:
         progress.register_feature(run_id, feature.feature_id, name=feature.name)
+
+    # Pre-register the BASELINE (planner-authored) test cases as `queued` RIGHT NOW,
+    # before recon starts — same rationale as route_to_workers' own pre-registration
+    # (see its docstring) and register_feature above: without this, test cards only
+    # appear once recon_join_node finishes (after all features are explored), making
+    # the UI show nothing but "Exploring application features…" for the full recon
+    # duration (confirmed at ~2.5 minutes when RECON_MAX_TURNS=12). Pre-registering
+    # here lets the cards appear as QUEUED immediately after the plan is approved,
+    # making the run's progress visible during the entire recon phase.
+    # Recon-discovered test cases can't be pre-registered (they don't exist yet) —
+    # they appear via route_to_workers' loop once recon finishes, which is correct.
+    for tc in state.get("test_cases", []):
+        progress.register(run_id, tc.test_id, total_steps=len(tc.steps))
+
     baseline_cases = state.get("test_cases", [])
     auth_state = state.get("auth_storage_state")
     return [
@@ -120,7 +135,7 @@ def _test_case_from_scenario(flow: FlowReport, scenario: ScenarioProposal, index
     )
 
 
-def recon_join_node(state: QAState) -> dict:
+async def recon_join_node(state: QAState) -> dict:
     """Barrier node reached via a PLAIN edge from recon_node (build_graph below), not a
     conditional one. CONFIRMED 2026-08-22, empirically, against installed langgraph
     1.2.11: this is required for correctness, not a style choice — a conditional edge
@@ -137,6 +152,14 @@ def recon_join_node(state: QAState) -> dict:
     already capped each Feature individually; this only trims further if MULTIPLE
     Features each proposed close to their own per-feature cap. Truncation is logged, not
     silent — a silently-capped run would read as complete coverage when it isn't.
+
+    async (unlike most of this module's plain functions): needs to await
+    drop_semantic_duplicates below, which is not something a LangGraph reducer
+    (core/state.py's _merge_test_cases, the actual consumer of this node's returned
+    test_cases) could ever do — reducers run synchronously inline during a channel
+    update, with no support for awaiting I/O. This node is where the async embedding
+    call has to happen instead, before the reducer's synchronous exact-match pass ever
+    sees the result.
     """
     all_scenarios = [(flow, s) for flow in state.get("flow_reports", []) for s in flow.scenarios]
     all_scenarios.sort(key=lambda item: (_PRIORITY_ORDER.get(item[1].priority, 1), item[1].rank))
@@ -162,7 +185,16 @@ def recon_join_node(state: QAState) -> dict:
     # omit a required field, confirmed live) — recon-discovered cases sit behind the
     # SAME kind of structured-output call (nodes/recon/nodes.py's ScenarioProposalOut)
     # and had never gotten this applied before now.
-    return {"test_cases": ensure_expected_result(accepted)}
+    accepted = ensure_expected_result(accepted)
+    # Semantic backstop for D3's own acknowledged risk: recon-discovered scenarios
+    # restating the planner's baseline in different words — recon_agent_node's
+    # existing_test_cases context (nodes/recon/state.py) only ever told the model not
+    # to; this is the deterministic check for when it does anyway. Compared against
+    # state["test_cases"] as it stands ENTERING this node — the baseline plan, untouched
+    # since planner_node/plan_review_node, since nothing between there and here writes
+    # to it.
+    accepted = await drop_semantic_duplicates(accepted, reference=state.get("test_cases", []))
+    return {"test_cases": accepted}
 
 
 def route_to_workers(state: QAState, config: RunnableConfig):

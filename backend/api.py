@@ -60,10 +60,10 @@ from sse_starlette.sse import EventSourceResponse
 from .core import llm_metrics, progress, run_knowledge
 from .core.discovery_state import DiscoveryState
 from .core.history import HistoryStore, make_history_store
-from .core.memory import make_store
+from .core.memory import drop_semantic_duplicates, make_store
 from .core.models import SiteMap, TestPlan
 from .core.run_context import run_id_var
-from .core.run_planning import ensure_expected_result, ensure_features, ensure_unique_test_ids
+from .core.run_planning import drop_duplicate_scenarios, ensure_expected_result, ensure_features, ensure_unique_test_ids
 from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
@@ -458,14 +458,43 @@ async def run_events(run_id: str, request: Request) -> EventSourceResponse:
     history = request.app.state.history
     config = {"configurable": {"thread_id": run_id}}
 
-    snapshot = await graph.aget_state(config)
-    if not await _run_exists(history, run_id, snapshot):
-        raise HTTPException(status_code=404, detail="unknown run_id")
+    # Guard: aget_state can itself raise InvalidUpdateError for a run whose checkpoint
+    # has pending (unmerged) conflicting writes — e.g. from a previous crash caused by
+    # the run_token bug fixed in core/state.py.  In that case fall back to a pure
+    # history-row existence check so we still get a 404 for genuinely unknown IDs.
+    try:
+        snapshot = await graph.aget_state(config)
+        if not await _run_exists(history, run_id, snapshot):
+            raise HTTPException(status_code=404, detail="unknown run_id")
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("run %s: initial aget_state failed — checking history for existence", run_id)
+        row = await history.get_session(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown run_id")
+        # Run exists but checkpoint is temporarily unreadable — proceed to event_stream
+        # which will retry aget_state on every tick and emit an error event if the run
+        # crashed, or recover once the checkpoint is readable again.
 
     async def event_stream() -> AsyncIterator[dict]:
         emitted_interrupt_ids: frozenset = frozenset()
         while True:
-            snapshot = await graph.aget_state(config)
+            try:
+                snapshot = await graph.aget_state(config)
+            except Exception:
+                # aget_state failed — this can happen when a run's checkpoint has
+                # unresolved pending writes from a partially-applied superstep (e.g.
+                # the run_token InvalidUpdateError that triggered before state.py was
+                # fixed).  Check history: if the run is already "error" emit the error
+                # event; otherwise sleep and retry so a transient failure self-heals.
+                logging.exception("run %s: aget_state failed in event stream — checking history", run_id)
+                row = await history.get_session(run_id)
+                if row and row["status"] == "error":
+                    yield {"event": "error", "data": json.dumps({"message": "run crashed", "run_id": run_id})}
+                    return
+                await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
+                continue
             pending = _pending_interrupts(snapshot)
             pending_ids = frozenset(i["id"] for i in pending)
 
@@ -554,13 +583,25 @@ async def retry_run(run_id: str, request: Request) -> dict:
     if row["status"] != "error":
         raise HTTPException(status_code=409, detail=f"run is not in an error state (status: {row['status']})")
 
-    snapshot = await graph.aget_state(config)
-    if not snapshot.next:
-        # The checkpoint says the run actually finished (or a resume already fixed it)
-        # even though history still says "error" — nothing left to re-drive. This can
-        # only happen if a previous retry succeeded but its history update raced this
-        # request; safer to say so than to silently re-run a finished graph.
-        raise HTTPException(status_code=409, detail="run has no pending work to resume")
+    # aget_state can raise if the checkpoint has pending conflicting writes from a
+    # prior crash (e.g. the run_token bug).  With state.py fixed the reducer now
+    # accepts those writes, so this should no longer fail — but guard anyway so an
+    # unforeseen future conflict doesn't make retry permanently inaccessible.
+    # When it does raise we skip the "already finished" guard (we can't read the
+    # snapshot) and proceed straight to re-driving; _drive itself will either succeed
+    # (reducer now correct) or fail again and set status back to "error".
+    try:
+        snapshot = await graph.aget_state(config)
+        if not snapshot.next:
+            # The checkpoint says the run actually finished (or a resume already fixed
+            # it) even though history still says "error" — nothing left to re-drive.
+            raise HTTPException(status_code=409, detail="run has no pending work to resume")
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception(
+            "run %s: aget_state failed in retry — proceeding with re-drive anyway", run_id
+        )
 
     await _update_history_status(history, run_id, "running")
     # input_=None: NOT Command(resume=...) — there is no pending interrupt to answer,
@@ -687,7 +728,13 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
         # this is defense in depth for the handoff into an actual run. ensure_features
         # is genuinely NEW defense here — discovery_agent_node does not yet backfill it
         # itself, unlike expected_result.
-        test_cases = ensure_expected_result(ensure_unique_test_ids(candidate_plan.test_cases))
+        test_cases = ensure_expected_result(ensure_unique_test_ids(drop_duplicate_scenarios(candidate_plan.test_cases)))
+        # Semantic backstop on top of the exact-match one above (core/memory.py's
+        # drop_semantic_duplicates) — redundant with discovery_agent_node's own per-turn
+        # call most of the time, but this is the one point every chat-approved run
+        # actually funnels through before execution, so it stays defense in depth rather
+        # than trusting an earlier turn's pass was never superseded by a later edit.
+        test_cases = await drop_semantic_duplicates(test_cases)
         features, test_cases = ensure_features(candidate_plan.features, test_cases)
         instruction = snapshot.values.get("starting_idea") or "(test plan authored via discovery chat)"
 

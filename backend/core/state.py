@@ -11,7 +11,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
 from .models import Feature, FlowReport, TestCase, TestResult
-from .run_planning import ensure_unique_test_ids
+from .run_planning import drop_duplicate_scenarios, ensure_unique_test_ids
 
 
 def _keep_latest(_current: str, new: str) -> str:
@@ -51,17 +51,22 @@ def _merge_test_cases(current: list[TestCase], new: list[TestCase]) -> list[Test
     superstep now would otherwise hit the identical `InvalidUpdateError` `_keep_latest`
     above exists to avoid.
 
-    Concatenates, then re-applies `ensure_unique_test_ids` (core/run_planning.py) over
-    the COMBINED list — plain `operator.add` only concatenates: a parallel recon branch
-    cannot see what its SIBLING branches are generating in the same superstep, so id
-    uniqueness (session_key/evidence-dir collisions ride on it — see that function's own
-    docstring) is unachievable at production time and must be enforced here, at merge
-    time, instead. Deterministic and idempotent by construction: `ensure_unique_test_ids`
-    walks the list in a fixed order and only suffixes an id that's ALREADY taken, so a
-    LangGraph node replay re-running this reducer over the same current+new never
-    renumbers an id it already assigned on an earlier pass.
+    Concatenates, then drops exact-content duplicates (`drop_duplicate_scenarios` —
+    confirmed live to matter here specifically: a recon-discovered scenario restating
+    the planner's baseline, D3's own acknowledged risk) before re-applying
+    `ensure_unique_test_ids` (core/run_planning.py) over the COMBINED list — plain
+    `operator.add` only concatenates: a parallel recon branch cannot see what its
+    SIBLING branches are generating in the same superstep, so both content
+    de-duplication and id uniqueness (session_key/evidence-dir collisions ride on the
+    latter — see that function's own docstring) are unachievable at production time and
+    must be enforced here, at merge time, instead. Deterministic and idempotent by
+    construction: dropping exact-match duplicates is order-stable (first occurrence
+    wins, same list in = same list out), and `ensure_unique_test_ids` walks the list in
+    a fixed order and only suffixes an id that's ALREADY taken, so a LangGraph node
+    replay re-running this reducer over the same current+new never renumbers an id it
+    already assigned on an earlier pass.
     """
-    return ensure_unique_test_ids([*current, *new])
+    return ensure_unique_test_ids(drop_duplicate_scenarios([*current, *new]))
 
 
 class QAState(TypedDict):
@@ -69,8 +74,18 @@ class QAState(TypedDict):
     instruction: str
     discovery_context: str  # freeform context from a prior chat/HITL discovery phase
                              # (credentials, user preferences/clarifications); "" if none.
-    run_token: str  # set by planner_node — a run-unique, non-LLM value injected into
-                     # PLANNER_PROMPT for unique generated test data (see core/run_planning.py).
+    run_token: Annotated[str, _keep_latest]  # set by planner_node — a run-unique,
+                     # non-LLM value injected into PLANNER_PROMPT for unique generated test data
+                     # (see core/run_planning.py). Needs _keep_latest for the same reason
+                     # target_url does (see that field's own docstring): route_to_recon Sends it
+                     # into every parallel recon_node branch via ReconState.run_token, and each
+                     # branch carries the same (unmodified) value through to its final state,
+                     # causing N concurrent writes to this channel in the same superstep.
+                     # Without a reducer, LangGraph raises InvalidUpdateError as soon as 2+
+                     # recon branches complete together — confirmed by the live bug. All
+                     # branches write the IDENTICAL value (set once by planner_node before
+                     # the fan-out and never touched again), so _keep_latest is correct:
+                     # which write wins is irrelevant.
     test_cases: Annotated[list[TestCase], _merge_test_cases]
     # Features the planner/discovery chat identified from the user's instruction (e.g.
     # "Sign-Up", "Create Agent") — the top level of the Feature -> Flow -> Scenario
@@ -156,3 +171,39 @@ class WorkerState(TypedDict):
     # grading against a browser that may itself be the thing that's wedged is meaningless
     # and risks the exact same hang this mechanism exists to bound.
     abort_reason: str | None
+
+    # ── Adaptive replanning fields ────────────────────────────────────────────
+    # Initialized on turn 1 by agent_node; all use last-write-wins (no reducer) since
+    # only this one worker's sequential nodes ever write them, and they're not QAState
+    # field names so a subgraph-as-node merge never has to reconcile them. Stored as
+    # str | None / list | None so state.get() returns None before first write.
+
+    # Immutable copy of test_case.goal — survives all replanning rounds so verdict_node
+    # always grades against the ORIGINAL high-level intent, not the current step set.
+    objective: str | None
+
+    # Mutable current step list — starts as test_case.steps, replaced by
+    # rediscovery_node each time it generates a new plan.
+    working_steps: list[str] | None
+
+    # Incremented each time rediscovery_node produces a new plan (0 = original plan).
+    # Used by verdict_node to decide whether to include plan-evolution context.
+    plan_version: int | None
+
+    # One entry per rediscovery round: {version, trigger, original_steps, new_steps,
+    # reason, replanned}. Replaced wholesale on each write (not appended) — no
+    # operator.add reducer, just last-write-wins with the full accumulated list.
+    plan_history: list[dict] | None
+
+    # Set True by tool_node when the agent calls trigger_rediscovery_tool; cleared by
+    # rediscovery_node after it generates the updated plan.
+    needs_rediscovery: bool | None
+
+    # What significant transition just completed (from trigger_rediscovery args) —
+    # context for the rediscovery LLM prompt; cleared alongside needs_rediscovery.
+    mutation_context: str | None
+
+    # Updated expected-result string from the latest rediscovery_node call; None means
+    # use the original test_case.expected_result. Set by rediscovery_node when the LLM
+    # decides the observable success criterion changed after replanning.
+    current_expected_result: str | None

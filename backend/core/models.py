@@ -6,7 +6,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-TestCategory = Literal["happy_path", "edge_case", "negative", "error_handling"]
+TestCategory = Literal[
+    "happy_path", "edge_case", "negative", "error_handling", "security", "state_interaction"
+]
 TestPriority = Literal["high", "medium", "low"]
 
 # Shared between PLANNER_PROMPT (nodes/planner.py) and DISCOVERY_SYSTEM_PROMPT
@@ -98,7 +100,8 @@ step navigate to it explicitly.
   Do NOT add a final "Verify ..." or "Check ..." step: grading against expected_result
   happens automatically after your last step, so a verification step only burns part of
   the worker's limited turn budget.
-- category: exactly one of happy_path, edge_case, negative, error_handling.
+- category: exactly one of happy_path, edge_case, negative, error_handling, security,
+  state_interaction.
   - happy_path: the normal, expected-to-succeed flow.
   - edge_case: boundary or unusual-but-valid input or ordering (empty optional field,
     very long input, special characters, minimum/maximum values, unusual but legitimate
@@ -110,6 +113,15 @@ step navigate to it explicitly.
   - error_handling: recovering from or observing behavior after an error state
     (submitting twice, going back after an error, correcting a rejected input and
     resubmitting, checking that an error message is specific rather than generic).
+  - security: ONLY for a free-text field you actually observed that gets echoed back or
+    stored (a name, a bio, a comment) — typing a script-injection payload (e.g.
+    `<script>alert(1)</script>`) should be sanitized/escaped/rejected, never executed or
+    stored verbatim. Never invent this for a field with no evidence it accepts or displays
+    free text.
+  - state_interaction: ONLY for a control you actually observed to be stateful in itself —
+    a password-visibility toggle, an expand/collapse section, a wizard's back/forward step.
+    Passes if the control's own state changes as expected; this is not for flows that end
+    in a page navigation, which belong under happy_path/edge_case instead.
 - priority: high, medium, or low — how much it would matter if this behavior were broken.
   Auth, payment and data-loss paths are high; cosmetic or rarely-hit paths are low.
 - preconditions: a short DISPLAY-ONLY list describing the state this case starts from,
@@ -297,7 +309,11 @@ class TestCase(BaseModel):
     category: TestCategory = Field(
         description="happy_path = normal expected-to-succeed flow. edge_case = boundary/unusual-but-valid "
         "input or ordering. negative = input/action that should be REJECTED by the site. "
-        "error_handling = observing/recovering from an error state."
+        "error_handling = observing/recovering from an error state. security = a free-text input field "
+        "echoed back or stored should sanitize/reject a script-injection payload rather than execute or "
+        "store it verbatim — only for a field actually observed to accept free text, never invented. "
+        "state_interaction = a control's own UI state should change as expected (a visibility toggle, an "
+        "expand/collapse, a wizard step back/forward) — only for a control actually observed to be stateful."
     )
     priority: TestPriority = Field(default="medium", description="Relative importance for a human skimming the plan.")
     requires_auth: bool = Field(

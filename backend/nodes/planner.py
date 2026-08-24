@@ -12,9 +12,15 @@ from contextlib import AsyncExitStack
 from langgraph.store.base import BaseStore
 
 from ..core.llm import ModelRole, with_fallback
-from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
+from ..core.memory import drop_semantic_duplicates, get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, TestPlan
-from ..core.run_planning import ensure_expected_result, ensure_features, ensure_unique_test_ids, generate_run_token
+from ..core.run_planning import (
+    drop_duplicate_scenarios,
+    ensure_expected_result,
+    ensure_features,
+    ensure_unique_test_ids,
+    generate_run_token,
+)
 from ..core.state import QAState
 from ..mcp.client import get_accessibility_snapshot, open_playwright_session
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -116,7 +122,11 @@ async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dic
     # structured output does not actually enforce TestCase.expected_result as required, so
     # a case missing it must be backfilled here — before it reaches plan_review's
     # model_dump(), the worker, or verdict_node — rather than trusted as always present.
-    test_cases = ensure_expected_result(ensure_unique_test_ids(plan.test_cases))
+    test_cases = ensure_expected_result(ensure_unique_test_ids(drop_duplicate_scenarios(plan.test_cases)))
+    # Semantic backstop on top of the exact-match one above — catches the same
+    # structured-output call restating a case in different words rather than verbatim
+    # (core/memory.py's drop_semantic_duplicates docstring).
+    test_cases = await drop_semantic_duplicates(test_cases)
     # Same class of gap, for Feature/feature_id (core/run_planning.py's ensure_features
     # docstring) — must run here, before route_to_recon (graph/builder.py) depends on
     # every test case's feature_id resolving to a real Feature.

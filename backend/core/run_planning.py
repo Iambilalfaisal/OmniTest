@@ -20,6 +20,40 @@ def generate_run_token() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
 
+def drop_duplicate_scenarios(test_cases: list[TestCase]) -> list[TestCase]:
+    """Drops a TestCase whose (goal, steps) exactly matches one already kept, keeping the
+    first occurrence.
+
+    Backstop, not the primary fix: TEST_CASE_AUTHORING_GUIDELINES' self-check (core/models.py)
+    already tells the model never to emit two cases with the same (goal, steps). That
+    instruction alone was confirmed, live, to be unreliable on gemini-3.5-flash-lite — one
+    run had a single case duplicated; a later run had its ENTIRE candidate plan emitted
+    twice in one structured-output call (5 cases -> 10, exact goal/step matches, verified
+    directly against the persisted checkpoint). Same class of gap as `expected_result` and
+    `feature_id` elsewhere in this module: a cheap model's structured output not reliably
+    honoring an instruction, needing a deterministic check in addition to the prompt fix,
+    not instead of it.
+
+    Also closes half of the plan doc's own D3 risk: recon's baseline-plus-top-up design
+    means a recon-discovered scenario can restate a case the planner's baseline already
+    covers. Applied at every point test_cases are finalized (api.py, planner.py, and the
+    `_merge_test_cases` reducer in core/state.py), so it catches both within-turn LLM
+    duplication and baseline/recon overlap the same way.
+
+    Exact match only (normalized by trim + casefold) — not fuzzy — so two cases that are
+    merely similar but prove different things are never mistaken for the same case.
+    """
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    result = []
+    for tc in test_cases:
+        key = (tc.goal.strip().casefold(), tuple(s.strip().casefold() for s in tc.steps))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(tc)
+    return result
+
+
 def ensure_unique_test_ids(test_cases: list[TestCase]) -> list[TestCase]:
     """De-dupe `test_id` after an LLM call. `route_to_workers` (graph/builder.py) and
     `session_key` (nodes/worker/session.py) both key a test case's isolated browser

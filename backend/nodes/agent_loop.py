@@ -84,6 +84,58 @@ ask_human_tool = StructuredTool.from_function(
     args_schema=AskHumanInput,
 )
 
+# ── trigger_rediscovery virtual tool ─────────────────────────────────────────
+# Intercepted by tool_node BEFORE MCP dispatch, exactly like ask_human_tool.
+# The agent calls this after completing a significant state transition (e.g. logging
+# in) so the system can take a fresh snapshot and regenerate the remaining steps
+# against what the app actually looks like now, rather than the pre-transition plan.
+
+TRIGGER_REDISCOVERY_TOOL_NAME = "trigger_rediscovery"
+
+
+class TriggerRediscoveryInput(BaseModel):
+    completed_transition: str = Field(
+        description=(
+            "Brief description of the significant state change just completed — e.g. "
+            "'successfully logged in to the application', 'completed onboarding wizard'."
+        )
+    )
+    new_observation: str = Field(
+        description=(
+            "What you can now see or access that was inaccessible before the transition — "
+            "e.g. 'the main dashboard is visible with a sidebar navigation'."
+        )
+    )
+
+
+async def _unreachable_rediscovery(**_kwargs) -> str:
+    raise RuntimeError(
+        f"{TRIGGER_REDISCOVERY_TOOL_NAME} must be intercepted by tool_node before this ever runs — "
+        "it is deliberately never added to a tool_node's MCP tool_map."
+    )
+
+
+# Same interception design as ask_human_tool — tool_node catches this by name, never
+# reaches the (unreachable) coroutine body. Not added to any MCP tool_map.
+trigger_rediscovery_tool = StructuredTool.from_function(
+    coroutine=_unreachable_rediscovery,
+    name=TRIGGER_REDISCOVERY_TOOL_NAME,
+    description=(
+        "Call this tool ONCE, immediately after you complete a significant state transition that "
+        "opens up application structure that was completely inaccessible before — most commonly: "
+        "successfully logging in (you can now see the authenticated dashboard), or completing an "
+        "onboarding wizard (you can now see the main app). After you call this, the system will "
+        "take a fresh look at the current page and give you an updated plan from your current "
+        "position toward the original objective.\n\n"
+        "When to call: you just logged in and the dashboard/home is visible; you just passed an "
+        "onboarding gate; any authentication or access-control step that revealed new structure.\n"
+        "When NOT to call: ordinary page navigation, filling a form field, clicking a button that "
+        "stays on the same screen, or any step that does NOT open new parts of the application. "
+        "Also do NOT call it more than once per major transition."
+    ),
+    args_schema=TriggerRediscoveryInput,
+)
+
 # Never offered to any agent_node in this codebase — not a prompt instruction, a hard
 # exclusion. Found directly from live runs: the model defaulted to
 # `browser_run_code_unsafe` (arbitrary JS in the PLAYWRIGHT SERVER PROCESS, per its own
@@ -127,6 +179,14 @@ didn't anticipate. When that happens, decide which of these buckets it's in.
 - A tool call that failed once, or a page that looks broken/blank right after navigating —
   take a fresh `browser_snapshot` and try once more before treating it as a real problem.
 - Needing to scroll or paginate to bring an element your step already names into view.
+- A button or submit control that appears disabled when you arrive at the page — NEVER
+  stop because of this. Execute all earlier steps first (fill every field your steps
+  describe), THEN attempt to click or interact with it. A button is commonly disabled
+  only because a required field is still empty: filling it enables the button. Also, in
+  many applications a click on a visually-disabled submit still triggers the
+  authentication or validation flow that IS the expected outcome of the test — you must
+  attempt the click to find out. Only treat an element as truly unclickable if
+  `browser_click` itself returns an error after you have filled all prior fields.
 
 ### Stop and call `ask_human` instead — never guess these
 - A password, code, or any other secret you were not given.

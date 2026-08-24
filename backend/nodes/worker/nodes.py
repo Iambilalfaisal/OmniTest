@@ -19,6 +19,7 @@ from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,7 @@ from ..agent_loop import (
     DEVIATION_POLICY,
     EXCLUDED_TOOL_NAMES,
     SCENARIO_DEADLINE_SECONDS,
+    TRIGGER_REDISCOVERY_TOOL_NAME,
     _risky_text_from_args,
     ask_human_and_reply,
     ask_human_tool,
@@ -40,6 +42,7 @@ from ..agent_loop import (
     new_deadline,
     review_if_risky,
     stale_snapshot_replacements,
+    trigger_rediscovery_tool,
     truncate_tool_result,
 )
 from .evidence import (
@@ -60,7 +63,7 @@ from .session import SessionGoneError, discard_session, get_session, session_key
 # large slice of MAX_CONCURRENT_WORKERS x 20 requests/day producing nothing; 8 caps that
 # downside while multi-action turns keep a legitimate flow from actually needing more
 # turns to fit the same steps. Override via env if a specific site's flows need more.
-MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "8"))
+MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "10"))  # 10 base turns: enough to navigate + act + hit an auth wall + still have turns left to call ask_human
 
 # Earned-extension budget (see agent_node/tool_node below): a worker starts at
 # MAX_TOOL_TURNS but gains TURN_BUDGET_BONUS turns, up to MAX_TOOL_TURNS_CEILING, each
@@ -68,7 +71,7 @@ MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "8"))
 # adapting only rises for the specific case that needed it, rather than raising the flat
 # cap (and therefore worst-case quota burn) for every case whether it deviates or not.
 MAX_TOOL_TURNS_CEILING = int(os.getenv("MAX_TOOL_TURNS_CEILING", "20"))
-TURN_BUDGET_BONUS = int(os.getenv("TURN_BUDGET_BONUS", "3"))
+TURN_BUDGET_BONUS = int(os.getenv("TURN_BUDGET_BONUS", "5"))  # 5 gives enough turns to complete login + resume original test after ask_human
 
 # How many times in a row the SAME tool call (name + args) can repeat before tool_node
 # appends a deterministic "you are stuck" nudge to its result — modeled on the proven
@@ -94,6 +97,94 @@ show. Follow them in order by default. When the real page doesn't match what a s
 assumes, do not just stop, and do not silently chase a different goal of your own either — \
 take the shortest correct route back onto the intended path that still reaches the SAME \
 expected result, and say what you changed in your final report.
+
+## RULE #1 — Every step requires an actual tool call. Never stop early.
+
+This is the most important rule. Read it before anything else.
+
+Each numbered step is ONLY "done" when you have called the browser tool that performs \
+the action. The mapping is exact:
+- "Navigate to X" / "Go to X" → call `browser_navigate`
+- "Click X" / "Select X" → call `browser_click` or `browser_select_option`
+- "Type X" / "Enter X" / "Fill X" → call `browser_type` or `browser_fill_form`
+
+**Seeing an element in a snapshot is NOT executing the step that targets it.** If step 2 \
+says "Click the Submit button" and your last snapshot showed a Submit button, you have \
+NOT completed step 2 — you must still call `browser_click` on it. The element appearing \
+in the accessibility tree only means it is present on the page.
+
+**Every response that still has unexecuted numbered steps MUST include at least one tool \
+call.** A response with only text and no tool call is correct ONLY on your very last turn, \
+after every step has been both executed AND its result observed. If you are writing \
+sentences describing what you intend to do, add the tool call to that same response — \
+do not describe an action and then stop without calling the tool.
+
+**Never call `trigger_rediscovery` before you have navigated to the application.** That \
+tool is exclusively for AFTER a login or similar gate WITHIN the app — never on a blank \
+page, never before step 1.
+
+**When you hit a login or signup wall, you MUST call `ask_human` — never stop silently.** \
+If you are trying to complete a goal (e.g. create an agent, submit a form) and the site \
+shows a login or signup screen you were not given credentials for, call `ask_human` \
+immediately to ask the reviewer whether to log in or sign up and with what credentials. \
+Do NOT stop calling tools, do NOT grade yourself Blocked, do NOT give up — ask first. \
+Calling `ask_human` also extends your turn budget by 3 turns, so running low on turns is \
+never a reason to skip it. Only use Blocked if you called `ask_human`, received an answer, \
+and STILL could not proceed past the wall (e.g. the credentials were wrong, there was a \
+CAPTCHA you could not bypass).
+
+## Page state is dynamic — NEVER treat a snapshot as a constraint
+
+Every `browser_snapshot` is a frozen frame of the page at ONE moment. The page changes as \
+you interact with it — filling a field, clicking a control, or scrolling can all change \
+what other elements look like or whether they respond. You MUST reason about FUTURE state, \
+not just the state you see right now, when deciding whether to execute a step.
+
+The single most important pattern: a button or submit control that appears disabled when \
+you first arrive at a page is disabled because a required field above it is still empty — \
+NOT because the action is unavailable. Filling the field enables the button. This is \
+standard web behaviour, and you will encounter it constantly. The correct response is \
+always: execute the fill steps first, then attempt the click. Never skip a step or call \
+`ask_human` because a downstream button looks disabled at the moment you arrive.
+
+The same logic applies more broadly:
+- A "Next" or "Continue" button that is greyed out → fill or select the required fields \
+  on this screen first, then click it.
+- A form that rejects your click with an error → read the error, correct the field it \
+  names, then resubmit — do not treat one rejection as a permanent block.
+- An input that looks read-only or inert → try typing into it anyway; the accessibility \
+  tree sometimes marks an interactive field incorrectly.
+- A click that produces no visible change → take a fresh `browser_snapshot`; the change \
+  may have happened somewhere else on the page (a counter, a panel, a toast notification).
+
+Execute your numbered steps in the order they are given. The current disabled/enabled \
+state of a later step's target is irrelevant to whether you execute the earlier steps — \
+always work through the sequence; the page will update itself as you go.
+
+## Trigger rediscovery after a significant state transition
+
+Sometimes a step in your plan completes a gate-like transition — the most common example \
+is successfully logging in, which reveals the authenticated application that was \
+completely inaccessible before your steps were written. When this happens, your original \
+remaining steps may be wrong because they describe a page structure that nobody had \
+seen yet when the plan was created.
+
+When you complete such a transition, call `trigger_rediscovery` ONCE. You will receive \
+an updated plan from the system, tailored to what the application actually looks like \
+right now, toward the same original objective.
+
+Call `trigger_rediscovery` ONLY when you have just:
+- Successfully logged in and can see the authenticated dashboard or home screen.
+- Completed an onboarding wizard or account-setup flow and can see the main application.
+- Passed through any other authentication or access-control gate that opened up entirely \
+  new application structure.
+
+Do NOT call it for:
+- Ordinary page navigation (clicking links, filling forms, going to a settings page).
+- Any step that doesn't open new parts of the application that were previously gated.
+- More than once per major transition — call it exactly once, then wait for the updated plan.
+
+When you call `trigger_rediscovery`, make it the ONLY tool call in that turn.
 """ + DEVIATION_POLICY + """
 Begin every response with exactly one line, before anything else, in this literal format \
 (this is for a progress display, not part of your reasoning):
@@ -138,16 +229,48 @@ usually the difference between finishing in budget or not.
 Once every step has been attempted, stop calling tools and wait for the verdict question.
 
 If you hit real ambiguity you cannot resolve yourself, call the `ask_human` tool rather \
-than guessing, fabricating a value, or silently giving up. This most commonly means: you \
-land on a login or signup screen that isn't part of your steps (even if nothing told you \
-to expect it) — stop immediately and ask whether to log in (and with what credentials) or \
-sign up, instead of guessing a password or abandoning the goal; or any other required \
-field or decision your steps simply don't cover. Never end your turns without either \
-having completed the goal or having called `ask_human` — reaching the verdict with the \
-goal unresolved and no `ask_human` call means you gave up silently, which is worse than \
-asking. Never quote a sensitive value (a password or other secret a human gave you) \
-verbatim in your final verdict — refer to it generically instead (e.g. "the provided \
-password").
+than guessing, fabricating a value, or silently giving up. The single most common case: \
+you land on a login or signup screen that is blocking your goal — even if nothing in your \
+steps mentioned authentication, even if you are almost out of turns. Call `ask_human` \
+IMMEDIATELY and ask "Should I log in or sign up to continue? If log in, what are the \
+credentials?" Do NOT stop, do NOT write a final message saying you couldn't proceed, do \
+NOT let the verdict be Blocked just because you hit an auth wall without asking. Calling \
+`ask_human` pauses execution and waits for the reviewer — it is NOT "giving up"; it is the \
+correct action. It also gives you 3 extra turns so you can complete the goal after the \
+answer arrives. Other `ask_human` triggers: any required field or decision your steps \
+don't cover. Never end your turns without either having completed the goal or having called \
+`ask_human` — reaching the verdict with the goal unresolved and no `ask_human` call means \
+you gave up silently, which is worse than asking. Never quote a sensitive value (a password \
+or other secret a human gave you) verbatim in your final verdict — refer to it generically \
+instead (e.g. "the provided password").
+
+## After ask_human returns — you MUST immediately act on the answer
+
+When the tool result for ask_human arrives, you will see:
+  "Human answer: <what the reviewer said>"
+  "Current page state after answer: <snapshot>"
+
+This is NOT the end of the test. You MUST use the answer to continue. Do NOT write a \
+text-only response after receiving an ask_human answer — call the next required tool \
+immediately, in the same response as any text you write.
+
+The most common case — credentials for a login wall:
+1. The page is showing a login/signup form.
+2. Read the email/username and password from "Human answer".
+3. In ONE turn, fill in ALL the form fields (email field, password field) and click the \
+   login button. Use `browser_fill_form` or individual `browser_type`/`browser_click` \
+   calls — batch them all into a single response with multiple tool calls.
+4. After login succeeds, navigate back to the page or step you were on before the auth \
+   wall appeared (the page your goal required) — do NOT assume the app will redirect you \
+   there automatically.
+5. Continue with the remaining original test steps from exactly where you left off.
+6. Do not treat the login itself as the end goal unless the test was specifically about \
+   logging in — the goal is whatever was in the original test case.
+
+If the reviewer said "sign up" instead of "log in", do the signup flow with the provided \
+details, then continue. If they said "skip", mark the test blocked and stop. If they gave \
+a specific instruction, follow it, then continue with the test.\
+
 
 Before you stop calling tools, make sure the browser is actually sitting on the state your \
 expected result describes: if your last action submitted a form or navigated, take one \
@@ -166,6 +289,11 @@ _CATEGORY_PASS_NOTES = {
     "negative": "Pass means the site correctly REJECTED this input/action with a visible "
     "error — if it incorrectly allowed it to succeed, that is a FAIL.",
     "error_handling": "Pass means the site's error state was handled or recovered from gracefully.",
+    "security": "Pass means the injection payload was sanitized/escaped/rejected — if it was echoed back "
+    "or stored unescaped (executable, or verbatim in a way that would render as markup), that is a FAIL, "
+    "same polarity as a negative case.",
+    "state_interaction": "Pass means the control's OWN state changed as expected (e.g. a toggle actually "
+    "flipped) — not that the page navigated anywhere.",
 }
 
 
@@ -289,6 +417,39 @@ class Verdict(BaseModel):
     )
 
 
+class RediscoveryPlan(BaseModel):
+    """Structured output for the rediscovery_node LLM call — decides whether the
+    remaining test steps need to be regenerated given the new application state seen
+    after a significant transition (e.g. logging in reveals the authenticated app)."""
+
+    should_replan: bool = Field(
+        description=(
+            "True if the new application state makes the original remaining steps wrong or "
+            "impossible — different URLs, element names, or flow structure. False if they "
+            "still make sense from the current position."
+        )
+    )
+    reason: str = Field(
+        description="1-2 sentences: why replanning is (or isn't) needed."
+    )
+    new_steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The updated steps to execute from the CURRENT position toward the original "
+            "objective, if should_replan is True. Each step is a single, concrete, actionable "
+            "instruction (e.g. 'Click the Create Agent button in the sidebar'). Empty list if "
+            "should_replan is False."
+        ),
+    )
+    updated_expected_result: str = Field(
+        default="",
+        description=(
+            "The updated expected-result text, if replanning changes what observable success "
+            "looks like. Empty string to keep the original."
+        ),
+    )
+
+
 async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_case = state["test_case"]
     test_id_var.set(test_case.test_id)  # see core/run_context.py — set per-node, not
@@ -333,6 +494,9 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     # function response turn").
     history = state.get("messages")
     seed: list = []
+    # Adaptive planning fields to include in the turn-1 return dict — only non-empty on
+    # the first turn (when seed is built), so later turns don't overwrite them needlessly.
+    init_adaptive_fields: dict = {}
     if not history:
         # Stage 3: inject the shared login (nodes/auth/nodes.py) BEFORE the model's first
         # turn, not after — it must land before this test case's own browser_navigate,
@@ -378,6 +542,19 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
             ),
         ]
         history = seed
+        # Seed the adaptive-planning state fields once, on turn 1.  These live in
+        # WorkerState as last-write-wins channels — writing them here means
+        # rediscovery_node and verdict_node can always read them via state.get(),
+        # even before any rediscovery has happened.
+        init_adaptive_fields = {
+            "objective": test_case.goal,
+            "working_steps": list(test_case.steps),
+            "plan_version": 0,
+            "plan_history": [],
+            "needs_rediscovery": False,
+            "mutation_context": "",
+            "current_expected_result": None,
+        }
 
     # Computed once, before the outbound call, and returned below alongside this turn's
     # response — that's what makes the compaction land in the checkpoint (WorkerState's
@@ -390,8 +567,12 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     # 0.3, not 0 — some Gemini variants (confirmed via a runtime warning against the
     # configured WORKER_MODEL) use fixed sampling defaults and ignore temperature=0
     # specifically; a non-zero value is more likely to actually take effect.
+    # trigger_rediscovery_tool is offered alongside ask_human_tool — both are virtual
+    # tools intercepted by tool_node before MCP dispatch, never reaching the MCP server.
     model = with_fallback(
-        ModelRole.WORKER, lambda m: m.bind_tools([*offered_tools, ask_human_tool]), temperature=0.3
+        ModelRole.WORKER,
+        lambda m: m.bind_tools([*offered_tools, ask_human_tool, trigger_rediscovery_tool]),
+        temperature=0.3,
     )
 
     # core/run_knowledge.py facts recorded by OTHER test cases in this same run (a
@@ -437,6 +618,79 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     )
     if deviated:
         progress.bump(run_id, test_case.test_id, "deviations")
+        # Emit a structured mutation event so the frontend's live WorkerCard can render
+        # a mutation timeline.  Best-effort: even if note is empty a deviation event is
+        # still useful (shows the step and that SOMETHING changed); the agent will keep
+        # going regardless of whether this emits cleanly.
+        progress.add_mutation_event(
+            run_id,
+            test_case.test_id,
+            type="deviation",
+            step=parsed_step or 0,
+            description=note or "Agent adapted to unexpected application state",
+        )
+        # Deviations are self-resolved immediately — the agent handled them without
+        # pausing; there's no human interaction to wait for.
+        progress.resolve_last_mutation(run_id, test_case.test_id)
+
+    # ── Auth-wall reconsideration gate ────────────────────────────────────────
+    # Fires when the model produced a text-only response (no tool calls) while turns
+    # remain in the budget AND the response text signals an auth/credential wall.
+    #
+    # Root cause: the model consistently hits a login modal, "knows" it lacks
+    # credentials, and writes a text summary (going silently to verdict_node as
+    # Blocked) instead of calling ask_human — even after multiple explicit prompt
+    # instructions. This is a model-prior failure, not a prompt-following failure:
+    # base models trained on typical QA automation strongly prefer "stop + report"
+    # over "ask the human for credentials."
+    #
+    # Fix: one targeted extra model invocation with an unambiguous enforcement
+    # message that leaves the model NO text-only exit path. Cost: one extra LLM
+    # call, but only in this exact scenario (~once per auth-gated test case) — far
+    # cheaper than silently marking a test Blocked without ever asking.
+    _next_turn = state.get("turn_count", 0) + 1  # what turn_count becomes after return
+    if not response.tool_calls and _next_turn <= turn_budget:
+        _resp_lower = str(response.content or "").lower()
+        _AUTH_SIGNALS = (
+            "login", "sign in", "sign up", "signup", "log in", "log-in",
+            "authentication", "credential", "password",
+            "blocked", "cannot proceed", "can't proceed",
+            "cannot complete", "can't complete",
+            "not provided", "not given",
+            "need to log", "need to sign",
+            "requires auth", "require auth",
+        )
+        if any(s in _resp_lower for s in _AUTH_SIGNALS):
+            _enforce = HumanMessage(
+                content=(
+                    "[System enforcement — no tool call detected while turns remain.]\n\n"
+                    "You described a blocker but made no tool call. This is not allowed. "
+                    "You MUST call `ask_human` right now. Do NOT write more text.\n\n"
+                    "Exact question to ask: "
+                    "'A login or signup wall appeared and is blocking the goal. "
+                    "Should I log in or sign up to continue? "
+                    "If log in, what are the credentials (email/username and password)?'\n\n"
+                    "Set sensitive=True because the answer will contain a password.\n\n"
+                    "Calling `ask_human` also extends your turn budget by 3 turns, so "
+                    "there will be plenty of turns to finish the task after the answer "
+                    "arrives. The ONLY acceptable response right now is the `ask_human` "
+                    "tool call — nothing else."
+                )
+            )
+            _retry = await model.ainvoke([*outbound, response, _enforce])
+            if _retry.tool_calls:
+                logging.info(
+                    "agent_node: reconsideration gate produced tool calls for %s "
+                    "(first response had none but signalled auth wall)",
+                    test_case.test_id,
+                )
+                response = _retry
+            else:
+                logging.warning(
+                    "agent_node: reconsideration gate FAILED for %s — model returned "
+                    "no tool calls on retry either; proceeding to verdict as Blocked",
+                    test_case.test_id,
+                )
 
     return {
         "messages": [*seed, *replacements, response],
@@ -444,6 +698,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         "turn_count": state.get("turn_count", 0) + 1,
         "turn_budget": turn_budget,
         "deadline_at": deadline_at,
+        **init_adaptive_fields,  # only non-empty on turn 1; noop thereafter
     }
 
 
@@ -453,6 +708,64 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     run_id = run_id_var.get()
     call, remaining = state["pending_tool_calls"][0], state["pending_tool_calls"][1:]
 
+    # ── trigger_rediscovery interception ──────────────────────────────────────
+    # Must come BEFORE ask_human and review_if_risky — this tool is never in the MCP
+    # tool_map (it's a virtual tool like ask_human_tool), so dispatching it would fail.
+    # Sets needs_rediscovery=True and mutation_context so route_after_tool can send
+    # execution to rediscovery_node once pending_tool_calls drains to empty.
+    if call["name"] == TRIGGER_REDISCOVERY_TOOL_NAME:
+        completed_transition = call["args"].get("completed_transition", "a state transition")
+        new_observation = call["args"].get("new_observation", "")
+        mutation_ctx = f"{completed_transition}. {new_observation}".strip(". ")
+
+        # Guard: refuse the call if the agent has not navigated anywhere yet (browser is
+        # still on the default blank page). trigger_rediscovery is only meaningful after
+        # the agent has already been working inside the application and completed a real
+        # transition (login, onboarding). Calling it on a blank page would send
+        # rediscovery_node a useless "blank" snapshot and likely cause the agent to loop
+        # without ever navigating, burning the entire turn budget.
+        # Heuristic: turn_count == 0 means this is the VERY FIRST tool call of the test
+        # case — no navigation could possibly have happened yet.
+        if state.get("turn_count", 0) == 0:
+            premature_reply = ToolMessage(
+                content=(
+                    "[trigger_rediscovery called too early — you have not navigated to the "
+                    "application yet. This tool is only for use AFTER you have completed a "
+                    "login or similar transition WITHIN the app. Please call browser_navigate "
+                    "first, complete the earlier numbered steps, and only call "
+                    "trigger_rediscovery once you have successfully logged in or passed a "
+                    "gate that reveals new application structure.]"
+                ),
+                tool_call_id=call["id"],
+                name=call["name"],
+            )
+            progress.update(run_id, test_id, phase="running", current_action=None)
+            return {"messages": [premature_reply], "pending_tool_calls": remaining}
+
+        # Acknowledge the virtual tool call so the agent gets a ToolMessage back —
+        # without this the AIMessage's tool_calls list would have an un-replied call,
+        # which many LLM providers reject as a malformed turn.
+        reply = ToolMessage(
+            content=(
+                "[Rediscovery triggered — the system will now observe the current application "
+                "state and update your plan. Wait for the updated plan before continuing.]"
+            ),
+            tool_call_id=call["id"],
+            name=call["name"],
+        )
+        progress.update(
+            run_id, test_id,
+            phase="rediscovering",
+            current_action=f"Re-observing app after: {completed_transition[:60]}",
+        )
+        return {
+            "messages": [reply],
+            "pending_tool_calls": remaining,
+            "needs_rediscovery": True,
+            "mutation_context": mutation_ctx,
+        }
+
+    # ── ask_human interception ─────────────────────────────────────────────────
     # Checked BEFORE review_if_risky, not after: agent_loop._is_risky substring-matches
     # RISKY_KEYWORDS against "{name} {args}" — a clarifying question whose text happens
     # to contain one of those words (e.g. mentions "removing" something) would
@@ -495,6 +808,19 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
             )
             progress.update(run_id, test_id, phase="running", current_action=None)
             progress.bump(run_id, test_id, "asks")
+            # Reused answers bypass the interrupt() path entirely — record the event as
+            # immediately resolved so the frontend's mutation timeline still shows the
+            # question + answer without leaving an unresolved slot.
+            progress.add_mutation_event(
+                run_id, test_id,
+                type="clarification",
+                description=question,
+                sensitive=bool(reused.get("sensitive", False)),
+            )
+            progress.resolve_last_mutation(
+                run_id, test_id,
+                user_decision="[reused from another test case in this run]",
+            )
             updates: dict = {"messages": [reply], "pending_tool_calls": remaining}
             if reused["sensitive"]:
                 # This worker's OWN sensitive_answers, not the answering worker's — each
@@ -504,16 +830,40 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
                 updates["sensitive_answers"] = [*state.get("sensitive_answers", []), reused["answer"]]
             return updates
 
+        # Emit the mutation event BEFORE interrupt() — interrupt() pauses execution at
+        # the LangGraph level so any write AFTER it only runs post-resume; the frontend
+        # needs to see the "waiting for input" event while the pause is active.
+        progress.add_mutation_event(
+            run_id, test_id,
+            type="clarification",
+            step=state.get("turn_count", 0),
+            description=question,
+            sensitive=bool(call["args"].get("sensitive", False)),
+        )
+
         # get_session runs INSIDE ask_human_and_reply, only after interrupt() returns
         # (its own docstring's deliberate ordering) — a failure there would otherwise
         # propagate uncaught out of this node and crash the whole run, same reasoning
         # as agent_node's session-open guard.
+        #
+        # CRITICAL: GraphInterrupt (raised by interrupt() inside ask_human_and_reply)
+        # is a subclass of Exception in LangGraph 1.2.x. Without the explicit re-raise
+        # below, `except Exception` would swallow the interrupt and set abort_reason to
+        # "could not open a browser session (@interrupt{...})", silently preventing the
+        # HITL pause from ever working. GraphInterrupt must bubble up to the LangGraph
+        # runtime so it can checkpoint the state and emit a 'paused' SSE event.
         try:
             reply, answer_text, sensitive = await ask_human_and_reply(call, _tool_map, subject_id=test_id)
+        except GraphInterrupt:
+            raise  # Let LangGraph's interrupt machinery handle this — never catch it
         except Exception as exc:
             logging.exception("tool_node: failed to open a session resuming ask_human for %s — aborting", test_id)
             return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
         run_knowledge.record_answer(run_id, question, answer_text, sensitive=sensitive)
+        # Resolve the mutation event now that the human has answered — store a masked
+        # placeholder for sensitive answers so the frontend never displays the real secret.
+        resolved_decision = "[sensitive — not displayed]" if sensitive else answer_text
+        progress.resolve_last_mutation(run_id, test_id, user_decision=resolved_decision)
         progress.update(run_id, test_id, phase="running", current_action=None)
         progress.bump(run_id, test_id, "asks")
         # An answered ask_human earns the same budget bonus a handled deviation does
@@ -534,6 +884,26 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
         return updates
 
     progress.update(run_id, test_id, phase="awaiting_input", current_action=f"reviewing: {call['name']}")
+
+    # Emit the mutation event before review_if_risky's interrupt() for the same reason
+    # as the ask_human branch above: writes after interrupt() only run post-resume.
+    # Only emit if the tool is actually risky — review_if_risky returns None immediately
+    # for safe calls, so we'd produce a spurious event.  Use a sentinel flag to track
+    # whether we emitted one, so we can resolve it cleanly either way.
+    from ..agent_loop import _is_risky as _check_risky  # local import avoids a module-
+    # level circular dep on a private name — only needed in this one branch.
+    _risky_emitted = False
+    if _check_risky(call):
+        descriptor = _risky_text_from_args(call.get("args", {}))
+        description = f"Risky action requires approval: {call['name']}" + (f" — {descriptor}" if descriptor else "")
+        progress.add_mutation_event(
+            run_id, test_id,
+            type="clarification",
+            step=state.get("turn_count", 0),
+            description=description,
+        )
+        _risky_emitted = True
+
     decision = await review_if_risky(call, subject_id=test_id)
     # A real interrupt()/resume happened whenever decision is not None (review_if_risky
     # returns None with no pause for anything that isn't risky at all) — either way
@@ -542,12 +912,22 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     deadline_update = {"deadline_at": new_deadline()} if decision is not None else {}
     if decision is not None and not decision.get("approved", False):
         progress.update(run_id, test_id, phase="running", current_action=None)
+        if _risky_emitted:
+            reason = decision.get("reason") or "not approved"
+            progress.resolve_last_mutation(
+                run_id, test_id,
+                user_decision=f"Blocked: {reason}",
+            )
         blocked = ToolMessage(
             content=f"Blocked by human reviewer: {decision.get('reason', 'not approved')}",
             tool_call_id=call["id"],
             name=call["name"],
         )
         return {"messages": [blocked], "pending_tool_calls": remaining, **deadline_update}
+
+    # Approved (or not risky) — resolve any emitted event
+    if _risky_emitted and decision is not None:
+        progress.resolve_last_mutation(run_id, test_id, user_decision="Approved")
 
     # NOTE: a resume landing on a different process than the one that paused finds no
     # cached session here and transparently opens a fresh, unnavigated browser instead
@@ -652,9 +1032,12 @@ def _stuck_nudge(state: WorkerState, call: dict) -> str:
     budget = state.get("turn_budget") or MAX_TOOL_TURNS
     if state.get("turn_count", 0) >= budget - 1:
         parts.append(
-            "\n\n[You are on your last turn before this test case's budget runs out. If the goal is not yet "
-            "achieved, either finish it in this turn or call `ask_human` now — do not let the budget run out "
-            "silently.]"
+            "\n\n[You are on your last turn before this test case's budget runs out. "
+            "If the goal is not yet achieved: (a) if you are blocked on a login/auth wall "
+            "or need information from the reviewer, call `ask_human` — this EXTENDS your "
+            "budget by 3 turns so you can finish after the answer arrives; "
+            "(b) otherwise finish the remaining steps in this turn with tool calls. "
+            "Do NOT produce a text-only response — that ends the test case immediately.]"
         )
     return "".join(parts)
 
@@ -807,6 +1190,33 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         else ""
     )
 
+    # When replanning happened, grade against the UPDATED expected result and include plan
+    # evolution context so the verdict LLM understands the execution history.
+    plan_version = state.get("plan_version") or 0
+    plan_history = state.get("plan_history") or []
+    current_expected_result = state.get("current_expected_result")
+    grading_criterion = current_expected_result or _expected_result(test_case)
+
+    plan_evolution_note = ""
+    if plan_version > 0 and plan_history:
+        plan_evolution_note = "\n\nNote: this test case was REPLANNED during execution:\n"
+        for entry in plan_history:
+            if entry.get("replanned"):
+                new_steps_preview = "; ".join(entry.get("new_steps", [])[:4])
+                if len(entry.get("new_steps", [])) > 4:
+                    new_steps_preview += f" (+ {len(entry['new_steps']) - 4} more)"
+                plan_evolution_note += (
+                    f"  Trigger: {entry.get('trigger', '')}\n"
+                    f"  Reason: {entry.get('reason', '')}\n"
+                    f"  Updated steps from that point: {new_steps_preview}\n"
+                )
+        if current_expected_result:
+            plan_evolution_note += (
+                f"\nThe expected result was also updated: {current_expected_result}\n"
+                "Grade against this UPDATED expected result and the updated steps above, "
+                "not the original ones."
+            )
+
     verdict_text = (
         f"Here is the ACTUAL page state right now, captured fresh for this verdict — trust this over "
         f"anything you remember from earlier in the conversation if they seem to disagree:\n{final_snapshot}\n\n"
@@ -815,7 +1225,7 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         f"Goal: {test_case.goal}\n"
         f"Category: {test_case.category} — {_category_note(test_case.category)}\n"
         f"Expected result (the ONLY criterion; grade against this, not against your own idea of what "
-        f"should have happened): {_expected_result(test_case)}\n\n"
+        f"should have happened): {grading_criterion}\n\n"
         "How to decide:\n"
         "- Pass ONLY if the fresh page state above, or a tool result you can actually point to in this "
         "conversation, shows the expected result. Name that evidence in your reason.\n"
@@ -831,7 +1241,7 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
         "below tells you to. Name that exact wall in your reason.\n"
         "- A tool error, a crashed step, or any other unrelated blocker that ISN'T one of those named "
         "walls is a FAIL — say so plainly rather than grading the site's behavior you never got to "
-        f"observe.{budget_note}"
+        f"observe.{budget_note}{plan_evolution_note}"
     )
     # List content (text block + image_url block) only when there's actually an image —
     # confirmed against the installed langchain_google_genai's own accepted shape
@@ -922,6 +1332,171 @@ async def verdict_node(state: WorkerState, config: RunnableConfig) -> dict:
     }
 
 
+async def rediscovery_node(state: WorkerState, config: RunnableConfig) -> dict:
+    """Takes a fresh browser snapshot and calls an LLM (WORKER model with structured
+    output) to decide whether the remaining steps still make sense from the current
+    application state, or need to be regenerated toward the same original objective.
+
+    Called by route_after_tool when needs_rediscovery=True and pending_tool_calls is
+    empty — always returns to agent_node via a fixed edge, injecting either an updated
+    plan or a "no change needed" acknowledgement as a HumanMessage into the message
+    history so the agent picks up from the right place.
+
+    Failure modes are soft: if the snapshot or LLM call fails, execution continues with
+    the original remaining steps (logged at ERROR level). The test case never aborts
+    here — worst case it runs with a slightly stale plan, which is still better than
+    losing the test result entirely.
+    """
+    test_case = state["test_case"]
+    test_id_var.set(test_case.test_id)
+    run_id = run_id_var.get()
+
+    progress.update(run_id, test_case.test_id, phase="replanning", current_action="Generating updated plan")
+
+    # Fresh snapshot for the replanning LLM — taken from the already-open browser
+    # session (same session agent_node/tool_node use for this test case).
+    key = session_key(config, test_case.test_id)
+    try:
+        _, _, tool_map = await get_session(key)
+        fresh_snapshot = truncate_tool_result(
+            await invoke_tool_or_error_text(tool_map["browser_snapshot"], {})
+        )
+    except Exception:
+        logging.exception("rediscovery_node: failed to get snapshot for %s — keeping original plan", test_case.test_id)
+        fresh_snapshot = "[snapshot unavailable]"
+
+    objective = state.get("objective") or test_case.goal
+    mutation_context = state.get("mutation_context") or "a state transition"
+    working_steps = state.get("working_steps") or list(test_case.steps)
+    plan_version = state.get("plan_version") or 0
+    plan_history = list(state.get("plan_history") or [])
+    turn_count = state.get("turn_count", 0)
+
+    # Split working_steps into "already executed" and "still remaining" using turn_count
+    # as a proxy — not perfect (some turns don't advance a step) but good enough for
+    # providing the LLM context about what has and hasn't been done yet.
+    completed_steps = working_steps[:turn_count] if turn_count < len(working_steps) else working_steps
+    remaining_steps = working_steps[turn_count:] if turn_count < len(working_steps) else []
+
+    completed_block = (
+        "\n".join(f"{i + 1}. {s}" for i, s in enumerate(completed_steps)) or "(none yet)"
+    )
+    remaining_block = (
+        "\n".join(f"{i + 1}. {s}" for i, s in enumerate(remaining_steps)) or "(none remaining)"
+    )
+
+    rediscovery_prompt = (
+        f"ORIGINAL OBJECTIVE: {objective}\n\n"
+        f"WHAT JUST HAPPENED: {mutation_context}\n\n"
+        f"STEPS EXECUTED BEFORE THIS TRANSITION:\n{completed_block}\n\n"
+        f"REMAINING STEPS FROM THE CURRENT PLAN:\n{remaining_block}\n\n"
+        f"CURRENT APPLICATION STATE (fresh snapshot, taken right now):\n{fresh_snapshot}\n\n"
+        "Decide: do the remaining steps above still make sense from the current position, "
+        "given what you can see in the fresh snapshot?\n\n"
+        "Set should_replan=False if the remaining steps still describe reachable, visible "
+        "elements that lead toward the objective — even if a few labels differ slightly.\n"
+        "Set should_replan=True if the remaining steps describe a page or elements that no "
+        "longer exist in this new state, or if new required steps are now visible that the "
+        "original plan didn't know about.\n\n"
+        "If should_replan=True, generate new_steps from the CURRENT position (what you see "
+        "in the snapshot) toward the original objective — concrete, actionable steps.\n\n"
+        f"Original expected result: {_expected_result(test_case)}\n"
+        "If replanning changes what observable success looks like, update updated_expected_result."
+    )
+
+    model = with_fallback(
+        ModelRole.WORKER,
+        lambda m: m.with_structured_output(RediscoveryPlan),
+        temperature=0,
+    )
+
+    try:
+        plan: RediscoveryPlan = await model.ainvoke([HumanMessage(rediscovery_prompt)])
+    except Exception:
+        logging.exception(
+            "rediscovery_node: LLM call failed for %s — keeping original plan", test_case.test_id
+        )
+        progress.update(run_id, test_case.test_id, phase="running", current_action=None)
+        return {"needs_rediscovery": False, "mutation_context": ""}
+
+    new_plan_version = plan_version + 1
+    new_plan_history = [
+        *plan_history,
+        {
+            "version": new_plan_version,
+            "trigger": mutation_context,
+            "original_steps": working_steps,
+            "new_steps": plan.new_steps if plan.should_replan else working_steps,
+            "reason": plan.reason,
+            "replanned": plan.should_replan,
+        },
+    ]
+
+    if plan.should_replan and plan.new_steps:
+        new_working_steps = plan.new_steps
+        new_expected = (
+            plan.updated_expected_result
+            or state.get("current_expected_result")
+            or _expected_result(test_case)
+        )
+        steps_block = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(new_working_steps))
+        plan_message = HumanMessage(
+            f"[PLAN UPDATED — {mutation_context}]\n"
+            f"Reason: {plan.reason}\n\n"
+            f"Your updated steps from the current position toward the original objective:\n"
+            f"{steps_block}\n\n"
+            f"Updated expected result: {new_expected}\n\n"
+            "Continue from step 1 of the updated plan above. Your original objective "
+            f"remains: {objective}"
+        )
+        # Record as a deviation event so the mutation timeline shows the plan change.
+        progress.add_mutation_event(
+            run_id, test_case.test_id,
+            type="deviation",
+            step=turn_count,
+            description=f"Plan updated after {mutation_context}: {plan.reason}",
+        )
+        progress.resolve_last_mutation(run_id, test_case.test_id, user_decision="Replanned")
+        progress.update(
+            run_id, test_case.test_id,
+            phase="running",
+            current_action=None,
+            plan_version=new_plan_version,
+            plan_history=new_plan_history,
+        )
+        return {
+            "messages": [plan_message],
+            "needs_rediscovery": False,
+            "mutation_context": "",
+            "working_steps": new_working_steps,
+            "plan_version": new_plan_version,
+            "plan_history": new_plan_history,
+            "current_expected_result": new_expected,
+        }
+    else:
+        # No replanning needed — inject an acknowledgement so the agent's message
+        # history stays well-formed and it knows to continue with its current plan.
+        no_change_message = HumanMessage(
+            f"[REDISCOVERY COMPLETE — no plan change needed]\n"
+            f"Reason: {plan.reason}\n\n"
+            "Your remaining steps are still valid from the current position. Continue with them."
+        )
+        progress.update(
+            run_id, test_case.test_id,
+            phase="running",
+            current_action=None,
+            plan_version=new_plan_version,
+            plan_history=new_plan_history,
+        )
+        return {
+            "messages": [no_change_message],
+            "needs_rediscovery": False,
+            "mutation_context": "",
+            "plan_version": new_plan_version,
+            "plan_history": new_plan_history,
+        }
+
+
 def route_after_agent(state: WorkerState) -> str:
     return "tool_node" if state["pending_tool_calls"] else "verdict_node"
 
@@ -933,6 +1508,11 @@ def route_after_tool(state: WorkerState) -> str:
     # of reaching verdict_node's abort_reason short-circuit.
     if state.get("abort_reason"):
         return "verdict_node"
+    # If the agent called trigger_rediscovery, route to rediscovery_node once all
+    # pending_tool_calls from that same turn have drained — any remaining calls execute
+    # first (in case the agent batched them), then rediscovery_node runs.
+    if state.get("needs_rediscovery") and not state["pending_tool_calls"]:
+        return "rediscovery_node"
     if state["pending_tool_calls"]:
         return "tool_node"
     budget = state.get("turn_budget") or MAX_TOOL_TURNS
@@ -948,10 +1528,18 @@ def build_worker_subgraph():
     # back to agent_node's next turn instead of raising, so this rarely matters.
     sub.add_node("tool_node", tool_node)
     sub.add_node("verdict_node", verdict_node, retry_policy=LLM_RETRY_POLICY)
+    # rediscovery_node uses an LLM (structured output) — retry policy mirrors verdict_node.
+    sub.add_node("rediscovery_node", rediscovery_node, retry_policy=LLM_RETRY_POLICY)
 
     sub.add_edge(START, "agent_node")
     sub.add_conditional_edges("agent_node", route_after_agent, ["tool_node", "verdict_node"])
-    sub.add_conditional_edges("tool_node", route_after_tool, ["tool_node", "agent_node", "verdict_node"])
+    sub.add_conditional_edges(
+        "tool_node", route_after_tool,
+        ["tool_node", "agent_node", "verdict_node", "rediscovery_node"],
+    )
+    # rediscovery_node always returns to agent_node — it injects the updated plan as a
+    # HumanMessage and the agent continues from there.
+    sub.add_edge("rediscovery_node", "agent_node")
     sub.add_edge("verdict_node", END)
 
     # No checkpointer passed — inherits the parent graph's, required for interrupt()

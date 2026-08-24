@@ -24,9 +24,9 @@ from langgraph.store.base import BaseStore
 
 from ..core.discovery_state import DiscoveryState
 from ..core.llm import ModelRole, with_fallback
-from ..core.memory import get_cached_site_map, retrieve_memory_context, save_site_map
+from ..core.memory import drop_semantic_duplicates, get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, DiscoveryTurn, SiteMap
-from ..core.run_planning import ensure_expected_result, ensure_features, generate_run_token
+from ..core.run_planning import drop_duplicate_scenarios, ensure_expected_result, ensure_features, generate_run_token
 from ..mcp.client import open_playwright_session
 from .planner import PLANNER_CRAWL_MAX_DEPTH, PLANNER_CRAWL_MAX_PAGES
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -207,8 +207,16 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
     # omit this required field, and this candidate_plan is read again next turn (by
     # _format_candidate_plan/_context_message above) as well as by the frontend — so it
     # must be backfilled every turn, not only once at final approval in api.py.
-    # ensure_features is the same defense for Feature/feature_id.
-    fixed_test_cases = ensure_expected_result(turn.candidate_plan.test_cases)
+    # ensure_features is the same defense for Feature/feature_id. drop_duplicate_scenarios
+    # is the same defense for a confirmed-live failure mode: a turn's structured output
+    # emitting the SAME candidate plan twice in one call — applied here too so the review
+    # panel the user approves from already shows the deduped set, not just the final
+    # approved run (api.py's own call is what actually matters for execution; this one is
+    # for an honest review UI). drop_semantic_duplicates runs second (only over whatever
+    # exact-match didn't already remove, since it's the one that costs an embedding call)
+    # to catch the SAME failure worded differently rather than repeated verbatim.
+    fixed_test_cases = ensure_expected_result(drop_duplicate_scenarios(turn.candidate_plan.test_cases))
+    fixed_test_cases = await drop_semantic_duplicates(fixed_test_cases)
     fixed_features, fixed_test_cases = ensure_features(turn.candidate_plan.features, fixed_test_cases)
     candidate_plan = turn.candidate_plan.model_copy(
         update={"test_cases": fixed_test_cases, "features": fixed_features}

@@ -5,9 +5,11 @@ import { usePathname } from "next/navigation";
 import OrbitMark from "@/components/OrbitMark";
 
 const NAV_ITEMS = [
-  { href: "/", label: "New session" },
-  { href: "/history", label: "History" },
-  { href: "/reports", label: "Reports" },
+  { href: "/",        label: "New session" },
+  { href: "/discover", label: "Discovery"  },
+  { href: "/run",      label: "Run"        },
+  { href: "/history",  label: "History"    },
+  { href: "/reports",  label: "Reports"    },
 ];
 
 export default function SidebarNav() {
