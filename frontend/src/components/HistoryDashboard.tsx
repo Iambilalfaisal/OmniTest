@@ -199,14 +199,14 @@ export default function HistoryDashboard() {
 
       {/* Filters — one row, above everything they scope */}
       <section className="glass-panel flex flex-wrap items-center gap-3 rounded-2xl p-3">
-        <div className="flex overflow-hidden rounded-full border border-white/10">
+        <div className="flex overflow-hidden rounded-full border border-white/10 bg-slate-950/50">
           {(["all", "run", "discovery"] as const).map((k) => (
             <button
               key={k}
               type="button"
               onClick={() => setKind(k)}
               className={`px-3 py-1.5 text-xs font-medium transition ${
-                kind === k ? "bg-cyan-500/20 text-cyan-200" : "bg-slate-950/50 text-slate-300 hover:text-white"
+                kind === k ? "bg-cyan-500/20 text-cyan-200" : "text-slate-300 hover:bg-white/5 hover:text-white"
               }`}
             >
               {k === "all" ? "All" : k === "run" ? "Runs" : "Discovery"}
@@ -217,7 +217,7 @@ export default function HistoryDashboard() {
         <select
           value={status}
           onChange={(e) => setStatus(e.target.value)}
-          className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400/60"
+          className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-xs text-slate-200 outline-none transition focus:border-cyan-400/60"
         >
           <option value="">All statuses</option>
           {statusOptions.map((s) => (
@@ -231,17 +231,17 @@ export default function HistoryDashboard() {
           value={urlInput}
           onChange={(e) => setUrlInput(e.target.value)}
           placeholder="Search target URL…"
-          className="min-w-[12rem] flex-1 rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400/60"
+          className="min-w-[12rem] flex-1 rounded-full border border-white/10 bg-slate-950/50 px-3 py-1.5 text-xs text-slate-200 outline-none transition focus:border-cyan-400/60"
         />
 
-        <div className="flex overflow-hidden rounded-full border border-white/10">
+        <div className="flex overflow-hidden rounded-full border border-white/10 bg-slate-950/50">
           {RANGE_OPTIONS.map((r) => (
             <button
               key={r.key}
               type="button"
               onClick={() => setRange(r.key)}
               className={`px-3 py-1.5 text-xs font-medium transition ${
-                range === r.key ? "bg-cyan-500/20 text-cyan-200" : "bg-slate-950/50 text-slate-300 hover:text-white"
+                range === r.key ? "bg-cyan-500/20 text-cyan-200" : "text-slate-300 hover:bg-white/5 hover:text-white"
               }`}
             >
               {r.label}
@@ -383,7 +383,7 @@ export default function HistoryDashboard() {
 function StatTile({ label, value, accent }: { label: string; value: string | number; accent?: "emerald" | "rose" }) {
   const valueColor = accent === "emerald" ? "text-emerald-300" : accent === "rose" ? "text-rose-300" : "text-white";
   return (
-    <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+    <div className="rounded-2xl border border-white/10 bg-slate-950/40 p-4 transition duration-300 hover:border-white/20 hover:bg-slate-900/60">
       <div className="text-xs uppercase tracking-[0.28em] text-slate-400">{label}</div>
       <div className={`mt-3 text-2xl font-semibold ${valueColor}`}>{value}</div>
     </div>

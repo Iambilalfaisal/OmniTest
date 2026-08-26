@@ -680,7 +680,7 @@ export default function RunPageClient() {
 
       {/* ── test case grid ── */}
       {groupedPlan ? (
-        <div className="flex flex-col gap-6">
+        <div className="grid items-start gap-6 grid-cols-[repeat(auto-fit,minmax(360px,1fr))]">
           {groupedPlan.groups.map(({ feature, testCases }) => {
             const fProgress = featureProgress[feature.feature_id];
             const fSummary  = summary?.by_feature?.[feature.feature_id];
@@ -713,7 +713,7 @@ export default function RunPageClient() {
                   </div>
                 </div>
                 {testCases.length > 0 && (
-                  <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+                  <div className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(340px,1fr))]">
                     {testCases.map((testCase, i) => (
                       <div key={testCase.test_id} className="animate-card-in" style={{ animationDelay: `${i * 60}ms` }}>
                         <WorkerCard
@@ -741,7 +741,7 @@ export default function RunPageClient() {
               <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">
                 Other test cases
               </h2>
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+              <div className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(340px,1fr))]">
                 {groupedPlan.ungrouped.map((testCase, i) => (
                   <div key={testCase.test_id} className="animate-card-in" style={{ animationDelay: `${i * 60}ms` }}>
                     <WorkerCard
@@ -764,7 +764,7 @@ export default function RunPageClient() {
           )}
         </div>
       ) : plan.length > 0 ? (
-        <section className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+        <section className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(340px,1fr))]">
           {plan.map((testCase, i) => (
             <div key={testCase.test_id} className="animate-card-in" style={{ animationDelay: `${i * 60}ms` }}>
               <WorkerCard
@@ -785,7 +785,7 @@ export default function RunPageClient() {
         </section>
       ) : !crashed && pendingInterrupts.length === 0 ? (
         // Planning phase — show skeleton cards while waiting for the plan
-        <section className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+        <section className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(340px,1fr))]">
           {[0, 1, 2].map((i) => (
             <SkeletonCard key={i} index={i} />
           ))}

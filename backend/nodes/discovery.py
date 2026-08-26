@@ -85,6 +85,22 @@ itself in a panel beside the chat.
 {TEST_CASE_AUTHORING_GUIDELINES}
 """
 
+# Appended to DISCOVERY_SYSTEM_PROMPT only for mode="quick" (DiscoveryState.mode) — the
+# base prompt above is written for a multi-turn conversation; this is what makes "Quick
+# Start" actually behave like a single-turn proposal-then-approve flow instead of just
+# changing the opening message. No `{`/`}` in here — appended before the one `.format
+# (run_token=...)` call in discovery_agent_node, so it must stay free of stray braces
+# (see core/models.py's TEST_CASE_AUTHORING_GUIDELINES docstring for the same constraint).
+DISCOVERY_QUICK_ADDENDUM = """
+
+QUICK MODE: the user wants a single-turn result, not a back-and-forth conversation. In \
+this one turn, propose a complete plan covering every major flow the site map shows \
+evidence of, state the assumption you're making for anything you'd normally ask about \
+(which credentials to use, whether to include a destructive action) rather than asking, \
+and set ready_to_run to true as soon as the plan meets the quality bar above — only ask a \
+question if running as-is would be genuinely unsafe (e.g. no way to sign in and no site-map \
+evidence of a sign-up flow either)."""
+
 
 def _discovery_llm():
     # Lazy for the same reason as planner._planner_llm — reuses PLANNER_MODEL rather than
@@ -171,8 +187,11 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
         memory_context = await retrieve_memory_context(
             state["target_url"], state["starting_idea"] or "general exploration", store
         )
+        system_prompt = DISCOVERY_SYSTEM_PROMPT + (
+            DISCOVERY_QUICK_ADDENDUM if state.get("mode") == "quick" else ""
+        )
         seed = [
-            SystemMessage(DISCOVERY_SYSTEM_PROMPT.format(run_token=run_token)),
+            SystemMessage(system_prompt.format(run_token=run_token)),
             HumanMessage(
                 f"{state['starting_idea'] or 'Explore this site and propose a test plan.'}\n\n"
                 f"Prior learnings about this site (from previous runs):\n{memory_context}"

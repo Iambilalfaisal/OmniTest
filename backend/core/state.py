@@ -5,7 +5,7 @@ the others.
 from __future__ import annotations
 
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
@@ -72,8 +72,16 @@ def _merge_test_cases(current: list[TestCase], new: list[TestCase]) -> list[Test
 class QAState(TypedDict):
     target_url: Annotated[str, _keep_latest]
     instruction: str
-    discovery_context: str  # freeform context from a prior chat/HITL discovery phase
-                             # (credentials, user preferences/clarifications); "" if none.
+    # freeform context from a prior chat/HITL discovery phase (credentials, user
+    # preferences/clarifications); "" if none. Needs _keep_latest for the same reason
+    # target_url does (see that field's own docstring): route_to_recon Sends it into
+    # every parallel recon_node branch via ReconState.discovery_context, and each
+    # branch carries the same (unmodified) value through to its final state, causing N
+    # concurrent writes to this channel in the same superstep — confirmed live via
+    # InvalidUpdateError as soon as 2+ recon branches (one per Feature) complete
+    # together. All branches write the IDENTICAL value (set once before the fan-out and
+    # never touched again), so _keep_latest is correct: which write wins is irrelevant.
+    discovery_context: Annotated[str, _keep_latest]
     run_token: Annotated[str, _keep_latest]  # set by planner_node — a run-unique,
                      # non-LLM value injected into PLANNER_PROMPT for unique generated test data
                      # (see core/run_planning.py). Needs _keep_latest for the same reason
@@ -87,6 +95,12 @@ class QAState(TypedDict):
                      # the fan-out and never touched again), so _keep_latest is correct:
                      # which write wins is irrelevant.
     test_cases: Annotated[list[TestCase], _merge_test_cases]
+    # Which discovery mode produced this run's plan — "quick"/"explore" from a chat-approved
+    # run (core/discovery_state.py's DiscoveryState.mode), None for a programmatic /runs call
+    # (including "My Own Plan", which never goes through discovery at all). Read-only after
+    # the initial set (route_to_recon, graph/builder.py) — nothing downstream ever writes it
+    # back, so unlike discovery_context/run_token/auth_storage_state it needs no reducer.
+    discovery_mode: Literal["explore", "quick"] | None
     # Features the planner/discovery chat identified from the user's instruction (e.g.
     # "Sign-Up", "Create Agent") — the top level of the Feature -> Flow -> Scenario
     # hierarchy (core/models.py's Feature). Written once, before any fan-out (same

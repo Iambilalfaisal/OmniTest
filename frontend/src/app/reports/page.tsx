@@ -1,5 +1,6 @@
 "use client";
 
+import { Suspense } from "react";
 import { FormEvent, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import TraceViewer from "@/components/TraceViewer";
@@ -40,7 +41,7 @@ type RunReport = {
   plan_approved: boolean;
 };
 
-export default function ReportsPage() {
+function ReportsPageContent() {
   const searchParams = useSearchParams();
   const [runId, setRunId] = useState(searchParams.get("id") ?? "");
   const [report, setReport] = useState<RunReport | null>(null);
@@ -245,5 +246,13 @@ export default function ReportsPage() {
 
       {activeTrace && <TraceViewer traceUrl={activeTrace} onClose={() => setActiveTrace(null)} />}
     </div>
+  );
+}
+
+export default function ReportsPage() {
+  return (
+    <Suspense fallback={<div className="glass-panel mx-auto max-w-xl rounded-3xl p-8 text-center text-slate-300">Loading reports…</div>}>
+      <ReportsPageContent />
+    </Suspense>
   );
 }

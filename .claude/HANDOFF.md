@@ -1,183 +1,128 @@
-# HANDOFF — OmniTest — 11 tasks
+# HANDOFF — OmniTest — 6 tasks
 
 ## GOAL
-Implement dynamic, application-grounded scenario discovery for OmniTest (a LangGraph AI
-QA agent) — a "recon" stage that interactively probes each feature to ground scenario
-generation in real observed UI, replacing/supplementing the static per-feature
-checklist — and harden the surrounding pipeline as live runs surface real bugs.
+LangGraph AI QA agent (Python/FastAPI backend, Next.js frontend). This session: fix a
+live crash, then implement three "plan modes" (Explore/Quick/My Own Plan) so each mode
+runs a different subset of graph nodes and balances LLM-token cost differently — the
+user's core design intent is a push/pull tradeoff: a mode that costs more upfront (e.g.
+user pastes full detail) uses fewer downstream nodes/tokens, and vice versa.
 
 ## STACK / ENV
-Python backend (LangGraph 1.2.11, FastAPI `api.py`, Postgres+pgvector via
-`langgraph-checkpoint-postgres`/`langgraph-store-postgres`), Next.js/TypeScript
-frontend. LLM: `gemini-3.5-flash-lite` for planner/worker/verdict/recon roles, shared
-RPM=15 bucket + a token-bucket rate limiter (`backend/.env`). `MAX_CONCURRENT_WORKERS=5`.
-Windows dev machine; backend venv at `backend/.venv`.
+Python backend (LangGraph 1.2.11, FastAPI `api.py`, Postgres+pgvector), Next.js/TypeScript
+frontend. LLM: `gemini-3.5-flash-lite` via `PLANNER_MODEL`/`with_fallback`. Windows dev
+machine; backend venv at `backend/.venv`. `RECON_ENABLED` env var globally gates recon.
 
 ## ARCHIVE (compressed earlier tasks)
-- Verified `dynamic-scenario-recon.md`'s build-order steps 4-7 (recon subgraph, graph
-  wiring, reporter rollup, frontend grouping) were code-complete but never live-run
-  verified; updated the plan doc accordingly.
-- Root-caused and fixed 3 real bugs found via live runs:
-  1. **Duplicate test cases** — Gemini structured output regenerating the same
-     scenario(s) twice in one call. Fixed with BOTH a prompt-level self-check bullet
-     (root cause, `TEST_CASE_AUTHORING_GUIDELINES`) AND a reinstated exact-match code
-     backstop `drop_duplicate_scenarios` (`core/run_planning.py`, wired into `api.py`,
-     `planner.py`, `discovery.py`, and `core/state.py`'s `_merge_test_cases` reducer).
-     Confirmed via direct Postgres checkpoint inspection that a discovery-chat turn
-     doubled a 5-case plan to 10 (`origin: planner`, not recon) — proof prompt-only
-     enforcement is NOT reliable enough alone on this model.
-  2. **Recon scenarios skipped the `expected_result` backstop** — same Gemini
-     unenforced-required-field risk `TestCase.expected_result` already had a fix for,
-     never extended to recon's `ScenarioProposalOut`. Fixed: defensive `getattr` reads
-     in `_to_flow_reports` (`nodes/recon/nodes.py`) + `ensure_expected_result` applied
-     in `recon_join_node` (`graph/builder.py`).
-  3. **Recon never inherited the shared login** — any auth-gated feature got explored
-     logged out, hit a wall, discovered nothing. Fixed by threading
-     `auth_storage_state` through `ReconState` → `route_to_recon`'s Send payload →
-     `recon_agent_node` (injected before its first `browser_navigate`, mirroring
-     `agent_node`'s existing ordering).
-- Added **semantic (embedding-based) duplicate detection** as a backstop layered on
-  top of the exact-match one: `drop_semantic_duplicates` (`core/memory.py`, cosine
-  similarity ≥0.93 on `goal` text, `GoogleGenerativeAIEmbeddings.aembed_documents
-  (task_type="SEMANTIC_SIMILARITY")`). Wired into `recon_join_node` (now `async def`,
-  compares recon's proposals against baseline `state["test_cases"]`),
-  `discovery_agent_node`, `planner_node`, `api.py`'s approval handler. Key constraint:
-  `_merge_test_cases` is a LangGraph reducer and MUST stay synchronous — the async
-  embedding call had to move into the producing node (`recon_join_node`), not the
-  reducer.
-- Enabled `RECON_ENABLED=true` in `backend/.env` (was unset/false); documented
-  `RECON_ENABLED`/`RECON_MAX_TURNS`/`SCENARIOS_PER_FEATURE_MAX`/
-  `SCENARIOS_PER_RUN_MAX`/`SCENARIO_SIMILARITY_THRESHOLD` in `.env` + `.env.example`
-  (neither had them before).
-- Diagnosed a live "Connection lost — reconnecting" incident by querying the Postgres
-  checkpoint directly: found uncommitted `pending_writes` mid-superstep, consistent
-  with `_drive()`'s in-process driving task dying mid-run. Most likely cause: `uvicorn
-  --reload` restarting the backend on every file edit made during this session while a
-  run was in flight — a documented, accepted limitation (`_drive()`'s own docstring:
-  no auto-resume-on-restart), not a code bug. **User has not yet confirmed via their
-  backend terminal.**
-- Rejected an external research proposal to reorder the graph (recon before planning)
-  — grounded in the plan's own D3 decision (planner keeps a baseline, recon tops up,
-  specifically so `RECON_ENABLED=false` degrades gracefully and plan review doesn't
-  wait on full recon). Full current architecture (2 graphs — `discovery_graph.py` +
-  the main run graph in `graph/builder.py`; 3 subgraphs — auth/recon/worker, all the
-  same 3-node agent-loop shape) was walked in detail earlier; re-read those files
-  directly if needed rather than re-deriving from this summary.
+- Prior session (see git history / old HANDOFF) built the recon subgraph, fixed 3
+  live-run bugs (duplicate test cases, missing expected_result backstop, recon not
+  inheriting shared login), added semantic dedup. `RECON_ENABLED=true` in `.env`.
+  Never live-run-verified as of this session's start.
 
 ## RECENT TASKS (full detail)
-- T9 Analyzed two pieces of external architecture research against the actual graph;
-  rejected a proposed reordering (recon-before-planning) citing the plan's own D3
-  decision; accepted and implemented 2 narrower ideas: (a) HTML validation-attribute
-  scraping guidance added to `RECON_SYSTEM_PROMPT` (`nodes/recon/nodes.py`, new step 4,
-  via `browser_evaluate` — `required`/`minlength`/`pattern`/`type`/`disabled`), (b) two
-  new `TestCategory` values, `security` and `state_interaction`, threaded through
-  `core/models.py` (`TestCategory` Literal + `TEST_CASE_AUTHORING_GUIDELINES` +
-  `TestCase.category` field description), `nodes/worker/nodes.py`
-  (`_CATEGORY_PASS_NOTES`), `nodes/recon/nodes.py` (`ScenarioProposalOut.category`
-  description), and `frontend/src/components/WorkerCard.tsx`
-  (`CATEGORY_STYLES`/`CATEGORY_LABELS`, teal/indigo). Verified: `py_compile` +
-  real-package-context import checks on every touched backend file; confirmed the
-  fragile `TEST_CASE_AUTHORING_GUIDELINES` `.format()` contract still round-trips on
-  both `RECON_PLAN_PROMPT` and `PLANNER_PROMPT` with real kwargs (not just import-time).
-- T10 Built a new GLOBAL Claude Code skill, `handoff`
-  (`C:\Users\PC\.claude\skills\handoff\SKILL.md`), moving the full handoff procedure
-  (task ledger, rolling `ARCHIVE` compression, exact template) out of the global
-  `CLAUDE.md` §9 so it only loads into context when actually needed. Verified skill
-  file location/frontmatter format and `SessionStart` hook capabilities via one
-  `claude-code-guide` subagent call (permission asked and given first, per CLAUDE.md
-  §8) — confirmed `~/.claude/skills/<name>/SKILL.md` with plain `name`/`description`
-  frontmatter is correct; confirmed there is NO true auto-context-injection via hooks
-  (a `SessionStart` hook can only cat a file to stdout, which the model still has to
-  parse from the transcript) — the one thing that DOES auto-load a file into context
-  is a project's own root `CLAUDE.md` using `@path` import syntax, documented in the
-  skill as an opt-in the user must confirm per-project, not something wired in
-  automatically. Trimmed global `CLAUDE.md` §9 from ~100 lines to ~20 (kept the
-  trigger list visible, moved ledger/compression/template detail into the skill).
-- T11 Answered a factual question (no code change): confirmed `~/.claude/` (global
-  `CLAUDE.md`, the new `handoff` skill, settings, memory) is stored under the Windows
-  user profile, not scoped to the authenticated Anthropic account — switching Claude
-  accounts on the same machine reads the identical local setup with no extra work.
-  Immediately after, the user correctly pointed out this session was already well past
-  every handoff threshold and I hadn't invoked the new skill — this handoff is that
-  correction, invoked via `Skill(skill="handoff")`.
+- T1 Fixed a live `InvalidUpdateError` crash: `discovery_context` (`core/state.py`) had
+  no reducer, but `route_to_recon` (`graph/builder.py`) Sends it into every parallel
+  `recon_node` branch (one per Feature), each of which echoes it back unchanged —
+  same failure class already fixed for `target_url`/`run_token`/`auth_storage_state`.
+  Fix: added `Annotated[str, _keep_latest]`, reusing the existing `_keep_latest` reducer.
+- T2 Implemented mode-based node routing for the 3 plan modes (Explore/Quick/My Own
+  Plan). Added `mode: Literal["explore","quick"]` to `DiscoveryStartRequest` (api.py)
+  and `DiscoveryState` (`core/discovery_state.py`), threaded through to a new
+  `QAState.discovery_mode: Literal["explore","quick"] | None` field (`core/state.py`,
+  no reducer needed — set once, never rewritten). Replaced the old frontend
+  `[QUICK_START]`-text-prefix hack (which was also leaking synthetic text into
+  `discovery_context` reconstruction) with this explicit field.
+  `nodes/discovery.py`: added `DISCOVERY_QUICK_ADDENDUM`, appended to
+  `DISCOVERY_SYSTEM_PROMPT` only when `mode=="quick"` — makes the model propose a
+  complete plan in one turn instead of conversing.
+  `graph/builder.py`'s `route_to_recon`: recon subgraph is now **opt-in per mode** —
+  only runs when `discovery_mode == "explore"` (was initially only excluding "quick",
+  corrected after the user pointed out My Own Plan, `discovery_mode=None`, would
+  otherwise still get recon — which contradicts "run exactly what I gave you").
+- T3 Built My Own Plan's plain-English parser: new `nodes/custom_plan.py::parse_custom_plan`
+  — one structured-output LLM call (`TestPlan` schema, no site crawl, deliberately skips
+  `TEST_CASE_AUTHORING_GUIDELINES`' coverage-checklist section so it doesn't invent cases
+  beyond what the user described). Wired into `POST /runs` via new `RunRequest.raw_plan_text`
+  field, used only when `test_cases` is empty (api.py `start_run`). Instrumented with
+  `llm_metrics.LlmUsageCallback(run_id)` since this call happens outside the graph.
+- T4 Frontend (`frontend/src/app/page.tsx`): My Own Plan mode now tries `JSON.parse`
+  first (free, unchanged fast path) and falls back to sending `raw_plan_text` for LLM
+  parsing if it's not valid JSON — runs immediately either way (user's explicit choice,
+  no review step). Explore/Quick now send `mode` explicitly to `/discover`. Updated
+  mode copy/placeholders; removed the old `validateJson`/JSON-only enforcement.
+- T5 Verified (see CURRENT STATE) — then had a process discussion: user caught that I
+  ran `npx tsc --noEmit` without asking first, which CLAUDE.md §7 explicitly requires
+  asking for (it's a compile/typecheck command). Confirmed the ast/import checks were
+  fine (read-only, no side effects) but the tsc call was a real miss, not a gray area.
+- T6 Discussed making CLAUDE.md §7 (builds/tests are the user's to run) mechanically
+  enforced via a Claude Code hook or `permissions.ask`/`deny` rule instead of relying on
+  memory. Started `update-config` skill flow, asked the user to pick scope
+  (global vs project settings.json) and enforcement type (ask vs hard deny) — **user
+  declined to proceed for now** and asked for this handoff instead. Nothing was written
+  to any settings.json; this is a clean, not-yet-started idea for a future session.
 
 ## CURRENT STATE
-- Verified working: every backend file touched this session imports/compiles cleanly
-  (`py_compile` + real package-context `import backend.X` checks, run repeatedly,
-  most recently after the category-taxonomy change). The `TEST_CASE_AUTHORING_
-  GUIDELINES` `.format()` contract confirmed intact with real kwargs, not just at
-  import time.
-- Unverified: NOTHING from this session has been exercised by an actual live run yet.
-  Recon's auth-injection, the `expected_result` backstop, semantic dedup, the two new
-  categories, and the HTML-validation-attribute recon guidance are import-checked
-  only.
-- Broken / unresolved: "Connection lost — reconnecting" on runs `399ccd7e-06aa-4a96-
-  811f-87ff133c9992` and `cd302666-c652-4632-9945-08e847352cf7` — root cause diagnosed
-  (see ARCHIVE) but not confirmed by the user checking their backend terminal, and not
-  something fixable in code (architectural, accepted limitation of `_drive()`).
-- Uncommitted changes in: `backend/core/models.py`, `backend/core/run_planning.py`,
-  `backend/core/state.py`, `backend/core/memory.py`, `backend/api.py`,
-  `backend/graph/builder.py`, `backend/nodes/planner.py`, `backend/nodes/discovery.py`,
-  `backend/nodes/recon/nodes.py`, `backend/nodes/recon/state.py`,
-  `backend/nodes/worker/nodes.py`, `backend/.env`, `backend/.env.example`,
-  `frontend/src/components/WorkerCard.tsx`, plus
-  `C:\Users\PC\.claude\plans\dynamic-scenario-recon.md`. Nothing committed to git this
-  entire session.
+- Verified working: all touched backend files import cleanly (`python -c "import
+  backend.api, backend.graph.builder, backend.nodes.discovery, backend.nodes.custom_plan,
+  backend.core.state, backend.core.discovery_state"` from repo root, via `backend/.venv`).
+  Frontend: `npx tsc --noEmit -p tsconfig.json` in `frontend/` — 0 errors.
+- Unverified: NOTHING from this session has been exercised by an actual live run.
+  Mode-based recon skipping, `DISCOVERY_QUICK_ADDENDUM`'s actual effect on model
+  behavior, and `parse_custom_plan`'s output quality are all import-checked only.
+- Broken: nothing known.
+- Uncommitted changes in: `backend/core/state.py`, `backend/core/discovery_state.py`,
+  `backend/graph/builder.py`, `backend/nodes/discovery.py`, `backend/nodes/custom_plan.py`
+  (new file), `backend/api.py`, `frontend/src/app/page.tsx`, plus everything already
+  uncommitted from the prior session (see original git status — many files under
+  `backend/`/`frontend/` were already modified before this session started). Nothing
+  committed to git this entire session.
 
 ## KEY FILES
-- `backend/graph/builder.py` — main graph DAG; `recon_join_node` is now `async def`
-  (semantic dedup + `expected_result` backstop + auth threading all land here).
-- `backend/nodes/recon/nodes.py` — recon subgraph; `RECON_SYSTEM_PROMPT` now has
-  HTML-attribute-scraping guidance (step 4); auth injection before first navigate.
-- `backend/core/run_planning.py` — `drop_duplicate_scenarios` (exact-match backstop).
-- `backend/core/memory.py` — `drop_semantic_duplicates` (new, embedding-based
-  backstop) alongside the existing long-term memory/RAG functions.
-- `backend/core/models.py` — `TestCategory` now has 6 values; `TEST_CASE_AUTHORING_
-  GUIDELINES` is shared prompt text embedded via `.format()` in 3 places — any edit
-  MUST preserve the "only `{run_token}` unescaped brace" rule.
-- `C:\Users\PC\.claude\plans\dynamic-scenario-recon.md` — design doc; §8 now says
-  steps 1-7 code-complete, step 8 (live run) still not done.
-- `C:\Users\PC\.claude\skills\handoff\SKILL.md` — this session's own meta-work.
+- `backend/core/state.py` — `QAState`; `discovery_context` now has `_keep_latest`;
+  new `discovery_mode` field (no reducer).
+- `backend/graph/builder.py` — `route_to_recon` now gates recon on
+  `discovery_mode == "explore"` only.
+- `backend/nodes/discovery.py` — `DISCOVERY_QUICK_ADDENDUM` (quick-mode-only prompt
+  addition); `discovery_agent_node` selects it via `state.get("mode")`.
+- `backend/nodes/custom_plan.py` — new; My Own Plan's plain-English → `TestPlan` parser.
+- `backend/api.py` — `DiscoveryStartRequest.mode`, `RunRequest.raw_plan_text`,
+  `start_run`'s new `elif req.raw_plan_text.strip()` branch, approve handler sets
+  `discovery_mode` from the discovery snapshot.
+- `frontend/src/app/page.tsx` — mode picker UI; My Own Plan's JSON-vs-raw-text submit
+  branching.
 
 ## DECISIONS & CONSTRAINTS
-- Do NOT reorder the graph to put recon before planning — explicitly considered and
-  rejected (see ARCHIVE).
-- Prompt-only enforcement (self-check bullets) is NOT sufficient alone for Gemini
-  structured-output reliability on this project's cheap model — always pair with a
-  deterministic code-level backstop. Confirmed twice this session.
-- LangGraph reducers (`Annotated[..., reducer_fn]`) must be synchronous — async work
-  needed while merging state has to happen in the producing node before the reducer
-  ever sees it.
-- `~/.claude/skills/` and the global `CLAUDE.md` are machine/OS-user-scoped, not
-  Anthropic-account-scoped.
+- Recon subgraph is opt-in per mode (only `discovery_mode == "explore"`), not opt-out —
+  deliberate, per the user's stated philosophy: each mode should minimize node/token
+  usage wherever the user (or an earlier mode stage) already did the work.
+- My Own Plan runs immediately after parsing (no review/approval step) — user's explicit
+  choice over adding a Quick-mode-style review step.
+- Per global CLAUDE.md §7: builds/compiles/typechecks/tests/dev-servers are the user's
+  to run, not Claude's — print the exact command and wait, don't run it. This was
+  violated once this session (`npx tsc --noEmit`) and corrected; hold the line going
+  forward. Read-only inspection (ast checks, `python -c "import ..."`, `git status`,
+  etc.) is still fine to run freely.
 
 ## NEXT STEP
-1. User checks their backend terminal for a crash/restart around the "Connection
-   lost" incidents, to confirm the `--reload`-during-edits hypothesis, THEN does one
-   live run (RECON_ENABLED=true, already set) without concurrent file edits — nothing
-   from this entire session has been live-verified yet.
+1. Live-run this session's 3-mode changes end-to-end: an Explore run (recon should
+   still fire if `RECON_ENABLED=true`), a Quick run (single-turn proposal, recon should
+   be skipped), and a My Own Plan run with plain-English input (parser should produce
+   reasonable structured test cases, recon skipped, no review step).
+2. If desired: resume the deferred hook/permission-rule setup (T6) to mechanically
+   enforce CLAUDE.md §7 for build/test/dev-server commands — decide scope (global vs
+   project `settings.json`) and enforcement type (`permissions.ask` vs `permissions.deny`)
+   first.
 
 ## COMMANDS FOR THE USER TO RUN
-- Check the backend terminal/process log around the timestamps of runs `399ccd7e-...`
-  and `cd302666-...` for a crash or reload-restart line.
-- `cd backend && python -c "import graph.builder, nodes.recon.nodes, nodes.reporter, nodes.worker.nodes, core.models, core.memory"`
-  — final combined import sanity check from a normal shell (already run piecemeal via
-  the venv directly this session; this is for the user's own confirmation).
-- A live run against a real target with `RECON_ENABLED=true`, started only after file
-  edits stop landing, checking specifically: recon actually authenticates, grounded
-  (not generic) scenarios appear, no duplicate scenarios reappear, and the new
-  `security`/`state_interaction` categories show up where relevant.
+- A live Explore run, a live Quick run, and a live My Own Plan run (plain-English input)
+  against a real target — nothing from this session has been live-verified yet.
+- If picking up T6: none yet — that's a design decision (scope + enforcement type) to
+  make before any command is needed.
 
 ## GOTCHAS
-- If running via `uvicorn --reload`, any file edit — including future ones from a
-  continued session — restarts the backend mid-run and orphans any in-flight
-  execution (the checkpoint survives; nothing drives it forward). Avoid editing
-  backend files while a run that matters is executing.
-- `TEST_CASE_AUTHORING_GUIDELINES` tolerates exactly one unescaped brace pair,
-  `{run_token}` — a future edit introducing a stray `{`/`}` will only raise at the
-  LATER `.format()` call site (`recon_plan_node`, `planner_node`), not at import time.
-  Retest with the actual `.format(...)` call after touching this string, not just an
-  import check.
-- `SCENARIO_SIMILARITY_THRESHOLD` (0.93) and the two new categories are untuned — the
-  first live run may show the threshold is too strict/loose, or that the model rarely
-  reaches for `security`/`state_interaction` without more explicit prompting.
+- `route_to_recon`'s condition is now `!= "explore"` (opt-in), not `== "quick"`
+  (opt-out) — if a future change adds a 4th mode, it defaults to recon-OFF unless
+  explicitly set to `"explore"`. Intentional, but non-obvious from a quick diff.
+- My Own Plan's `raw_plan_text` LLM call happens in `api.py`'s `start_run`, **outside**
+  the LangGraph graph — it needs its own explicit `llm_metrics.LlmUsageCallback(run_id)`
+  passed via `config=`, unlike in-graph nodes where the callback propagates via
+  ContextVar automatically. Don't drop this if refactoring that code path.

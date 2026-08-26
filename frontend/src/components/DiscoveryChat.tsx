@@ -2,7 +2,10 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { CATEGORY_LABELS, CATEGORY_STYLES, TestCase } from "@/components/WorkerCard";
+import { motion, AnimatePresence } from "framer-motion";
+import { Send, ClipboardList, MessageSquare } from "lucide-react";
+import { CATEGORY_LABELS, CATEGORY_STYLES } from "@/components/WorkerCard";
+import type { TestCase } from "@/components/WorkerCard";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -30,7 +33,6 @@ export default function DiscoveryChat() {
   useEffect(() => {
     if (!discoveryId) return;
     let cancelled = false;
-
     (async () => {
       try {
         const res = await fetch(`${API_BASE}/discover/${discoveryId}`);
@@ -50,10 +52,7 @@ export default function DiscoveryChat() {
         if (!cancelled) setLoading(false);
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [discoveryId]);
 
   useEffect(() => {
@@ -63,13 +62,11 @@ export default function DiscoveryChat() {
   async function sendMessage(e: FormEvent) {
     e.preventDefault();
     if (!discoveryId || !reply.trim() || sending) return;
-
     const text = reply.trim();
     setTranscript((prev) => [...prev, { role: "user", text }]);
     setReply("");
     setSending(true);
     setError(null);
-
     try {
       const res = await fetch(`${API_BASE}/discover/${discoveryId}/message`, {
         method: "POST",
@@ -133,15 +130,15 @@ export default function DiscoveryChat() {
 
   if (!discoveryId) {
     return (
-      <div className="glass-panel mx-auto max-w-xl rounded-3xl p-8 text-center">
-        <p className="text-slate-300">No discovery session selected — start one from the home page.</p>
+      <div className="glass-panel mx-auto max-w-xl rounded-3xl p-8 text-center" style={{ color: "var(--text-2)" }}>
+        No discovery session selected — start one from the home page.
       </div>
     );
   }
 
   if (loading) {
     return (
-      <div className="glass-panel mx-auto max-w-xl rounded-3xl p-8 text-center text-slate-300">
+      <div className="glass-panel mx-auto max-w-xl rounded-3xl p-8 text-center" style={{ color: "var(--text-2)" }}>
         Loading discovery session…
       </div>
     );
@@ -149,158 +146,292 @@ export default function DiscoveryChat() {
 
   const atTurnLimit = turnCount >= maxTurns;
   const canReply = status === "in_progress" && !atTurnLimit;
+  const nearLimit = !atTurnLimit && maxTurns - turnCount <= 3;
 
   return (
-    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6 py-4">
+    <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-4 py-4">
       <div className="page-grid pointer-events-none absolute inset-x-0 top-0 h-96 opacity-60" />
-      <header className="glass-panel animate-rise relative rounded-[2rem] p-6 md:p-8">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <div>
-            <p className="eyebrow">Discovery session / Live</p>
-            <h1 className="mt-2 text-2xl font-semibold text-white">{targetUrl}</h1>
-          </div>
-          <div className="flex items-center gap-4">
-            {sitePages > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1 text-xs font-medium text-fuchsia-300">
-                <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-400" />
-                {sitePages} page{sitePages !== 1 ? "s" : ""} explored
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+        className="glass-panel animate-rise relative flex min-h-[70vh] w-full overflow-hidden rounded-[1.75rem] lg:h-[calc(100vh-7rem)] lg:min-h-0 lg:flex-row"
+      >
+      {/* ── LEFT PANEL: Chat (45%) ────────────────────────── */}
+      <div className="flex w-full flex-col border-b border-white/10 lg:w-[45%] lg:border-b-0 lg:border-r lg:border-white/10">
+        {/* Chat header */}
+        <div
+          className="flex items-center justify-between px-5 py-3 shrink-0"
+          style={{ borderBottom: "1px solid var(--border)", background: "var(--bg-surface-2)" }}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <MessageSquare size={14} style={{ color: "var(--primary-bright)", flexShrink: 0 }} />
+            <span className="eyebrow-accent" style={{ color: "var(--primary-bright)" }}>Conversation</span>
+            {targetUrl && (
+              <span
+                className="text-xs truncate hidden sm:block"
+                style={{ color: "var(--text-3)" }}
+                title={targetUrl}
+              >
+                — {targetUrl}
               </span>
             )}
-            <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
-              Turn {turnCount}/{maxTurns}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {sitePages > 0 && (
+              <span className="badge badge-violet">{sitePages} pages</span>
+            )}
+            <span
+              className="badge"
+              style={
+                atTurnLimit || nearLimit
+                  ? { background: "var(--amber-bg)", border: "1px solid var(--amber-border)", color: "var(--amber)" }
+                  : { background: "var(--bg-elevated)", border: "1px solid var(--border-md)", color: "var(--text-2)" }
+              }
+            >
+              Turn {turnCount} / {maxTurns}
             </span>
           </div>
         </div>
-      </header>
 
-      <section className="grid gap-5 lg:grid-cols-[1fr_1fr]">
-        <div className="glass-panel flex max-h-[32rem] flex-col rounded-3xl p-5">
-          <h2 className="mb-3 text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">Conversation</h2>
-          <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+        {/* Messages scrollable area */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+          <AnimatePresence initial={false}>
             {transcript.map((m, i) => (
-              <div
+              <motion.div
                 key={i}
-                className={`rounded-2xl px-4 py-3 text-sm leading-6 ${
-                  m.role === "assistant"
-                    ? "border border-cyan-400/20 bg-cyan-500/5 text-slate-200"
-                    : "border border-white/10 bg-slate-950/40 text-white"
-                }`}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.22, ease: "easeOut" }}
+                className={m.role === "assistant" ? "flex justify-start" : "flex justify-end"}
               >
-                <div className="mb-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                  {m.role === "assistant" ? "OmniTest" : "You"}
+                <div
+                  style={{
+                    maxWidth: "86%",
+                    borderRadius: "10px",
+                    padding: "10px 14px",
+                    fontSize: "0.875rem",
+                    lineHeight: "1.6",
+                    ...(m.role === "assistant"
+                      ? {
+                          background: "var(--bg-surface-2)",
+                          borderLeft: "3px solid var(--primary)",
+                          color: "var(--text)",
+                        }
+                      : {
+                          background: "var(--primary-bg)",
+                          border: "1px solid var(--primary-border)",
+                          color: "var(--text)",
+                        }),
+                  }}
+                >
+                  <div
+                    className="eyebrow mb-1"
+                    style={{ color: m.role === "assistant" ? "var(--primary-bright)" : "var(--text-3)" }}
+                  >
+                    {m.role === "assistant" ? "OmniTest" : "You"}
+                  </div>
+                  {m.text}
                 </div>
-                {m.text}
-              </div>
+              </motion.div>
             ))}
-            {sending && (
-              <div className="flex items-center gap-2 rounded-2xl border border-cyan-400/20 bg-cyan-500/5 px-4 py-3 text-sm text-slate-400">
-                <span className="flex gap-1">
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-cyan-400 [animation-delay:-0.3s]" />
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-cyan-400 [animation-delay:-0.15s]" />
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-cyan-400" />
-                </span>
-                OmniTest is thinking…
-              </div>
-            )}
-            <div ref={transcriptEndRef} />
-          </div>
+          </AnimatePresence>
 
-          {error && (
-            <div className="mt-3 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-              {error}
-            </div>
-          )}
-
-          {atTurnLimit && status === "in_progress" && (
-            <p className="mt-3 text-xs text-amber-300">
-              Turn limit reached — approve the plan or cancel to start over.
-            </p>
-          )}
-
-          <form onSubmit={sendMessage} className="mt-3 flex gap-2">
-            <input
-              value={reply}
-              onChange={(e) => setReply(e.target.value)}
-              disabled={!canReply || sending}
-              placeholder={canReply ? "Reply, ask a question, or suggest a test case…" : "Conversation closed"}
-              className="flex-1 rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-2.5 text-sm text-white outline-none transition focus:border-cyan-400/70 focus:ring-2 focus:ring-cyan-500/30 disabled:opacity-50"
-            />
-            <button
-              type="submit"
-              disabled={!canReply || sending || !reply.trim()}
-              className="rounded-2xl bg-gradient-to-r from-cyan-500 to-violet-500 px-4 py-2.5 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-50"
+          {/* Typing indicator */}
+          {sending && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex justify-start"
             >
-              {sending ? "Sending…" : "Send"}
-            </button>
-          </form>
+              <div
+                style={{
+                  background: "var(--bg-surface-2)",
+                  borderLeft: "3px solid var(--primary)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 6,
+                }}
+              >
+                <div className="eyebrow" style={{ color: "var(--primary-bright)" }}>OmniTest</div>
+                <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                  {[0, 0.18, 0.36].map((delay) => (
+                    <motion.span
+                      key={delay}
+                      animate={{ y: [0, -5, 0] }}
+                      transition={{ duration: 0.75, repeat: Infinity, delay, ease: "easeInOut" }}
+                      style={{
+                        display: "inline-block",
+                        width: 7,
+                        height: 7,
+                        borderRadius: "50%",
+                        background: "var(--primary-bright)",
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          <div ref={transcriptEndRef} />
         </div>
 
-        <div className="glass-panel flex max-h-[32rem] flex-col rounded-3xl p-5">
-          <div className="mb-3 flex items-center gap-2">
-            <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-slate-400">
-              Candidate plan ({candidatePlan.length})
-            </h2>
-            {sending && (
-              <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.15em] text-cyan-300/80">
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-cyan-400/30 border-t-cyan-400" />
-                Updating…
-              </span>
-            )}
+        {/* Inline banners */}
+        {error && (
+          <div
+            className="mx-4 mb-2 rounded-lg px-4 py-2 text-sm"
+            style={{ background: "var(--rose-bg)", border: "1px solid var(--rose-border)", color: "var(--rose)" }}
+          >
+            {error}
           </div>
-          <div className={`flex-1 space-y-3 overflow-y-auto pr-1 transition-opacity ${sending ? "opacity-50" : ""}`}>
-            {candidatePlan.length === 0 ? (
-              <p className="text-sm text-slate-400">{sending ? "Building the first plan…" : "No plan proposed yet."}</p>
-            ) : (
-              candidatePlan.map((tc) => (
-                <div key={tc.test_id} className="rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-                  <div className="flex items-center gap-2">
-                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.15em] ${CATEGORY_STYLES[tc.category] ?? ""}`}>
+        )}
+        {nearLimit && !atTurnLimit && (
+          <div
+            className="mx-4 mb-2 rounded-lg px-3 py-2 text-xs"
+            style={{ background: "var(--amber-bg)", border: "1px solid var(--amber-border)", color: "var(--amber)" }}
+          >
+            {maxTurns - turnCount} turn{maxTurns - turnCount !== 1 ? "s" : ""} remaining — consider approving the plan soon.
+          </div>
+        )}
+        {atTurnLimit && status === "in_progress" && (
+          <div
+            className="mx-4 mb-2 rounded-lg px-3 py-2 text-xs"
+            style={{ background: "var(--amber-bg)", border: "1px solid var(--amber-border)", color: "var(--amber)" }}
+          >
+            Turn limit reached — approve the plan or cancel to start over.
+          </div>
+        )}
+
+        {/* Input area */}
+        <form
+          onSubmit={sendMessage}
+          className="flex gap-2 items-end px-4 py-4 shrink-0"
+          style={{ borderTop: "1px solid var(--border)" }}
+        >
+          <textarea
+            value={reply}
+            rows={3}
+            disabled={!canReply || sending}
+            placeholder={canReply ? "Reply, ask a question, or suggest a test case…" : "Conversation closed"}
+            onChange={(e) => setReply(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (canReply && !sending && reply.trim()) {
+                  sendMessage(e as unknown as FormEvent);
+                }
+              }
+            }}
+            className="input flex-1"
+            style={{ resize: "none" }}
+          />
+          <button
+            type="submit"
+            disabled={!canReply || sending || !reply.trim()}
+            className="btn-primary btn-icon"
+            style={{ alignSelf: "flex-end", padding: "10px" }}
+          >
+            <Send size={16} />
+          </button>
+        </form>
+      </div>
+
+      {/* ── RIGHT PANEL: Emerging Plan (55%) ─────────────── */}
+      <div className="flex w-full flex-col lg:flex-1">
+        {/* Plan header */}
+        <div
+          className="flex items-center justify-between px-5 py-3 shrink-0"
+          style={{ borderBottom: "1px solid var(--border)", background: "var(--bg-surface-2)" }}
+        >
+          <div className="flex items-center gap-2">
+            <ClipboardList size={14} style={{ color: "var(--cyan)", flexShrink: 0 }} />
+            <span className="eyebrow" style={{ color: "var(--cyan)", letterSpacing: "0.3em" }}>Test Plan</span>
+          </div>
+          <span className="badge badge-cyan">
+            {candidatePlan.length} test{candidatePlan.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+
+        {/* Test case cards */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+          {candidatePlan.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-center">
+              <ClipboardList size={36} style={{ color: "var(--text-3)", opacity: 0.35 }} />
+              <p className="text-sm" style={{ color: "var(--text-3)" }}>
+                The AI will propose tests here as you chat.
+              </p>
+            </div>
+          ) : (
+            <AnimatePresence>
+              {candidatePlan.map((tc, i) => (
+                <motion.div
+                  key={tc.test_id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.28, delay: Math.min(i * 0.04, 0.32), ease: "easeOut" }}
+                  className="glass-panel p-4"
+                >
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.15em] ${CATEGORY_STYLES[tc.category] ?? ""}`}
+                    >
                       {CATEGORY_LABELS[tc.category] ?? tc.category}
                     </span>
-                    <span className="text-[10px] uppercase tracking-[0.15em] text-slate-500">{tc.priority}</span>
+                    <span
+                      className="text-[10px] uppercase tracking-widest"
+                      style={{ color: "var(--text-3)" }}
+                    >
+                      {tc.priority}
+                    </span>
+                    {tc.steps?.length > 0 && (
+                      <span className="ml-auto text-[10px]" style={{ color: "var(--text-3)" }}>
+                        {tc.steps.length} step{tc.steps.length !== 1 ? "s" : ""}
+                      </span>
+                    )}
                   </div>
-                  <p className="mt-2 text-sm font-medium text-white">{tc.goal}</p>
+                  <p className="mt-2 text-sm font-medium" style={{ color: "var(--text)" }}>
+                    {tc.goal}
+                  </p>
                   {tc.preconditions?.length > 0 && (
-                    <p className="mt-1 text-xs italic text-slate-400">Setup: {tc.preconditions.join("; ")}</p>
-                  )}
-                  {tc.expected_result && (
-                    <p className="mt-1 text-xs text-slate-400">
-                      <span className="font-semibold text-slate-300">Expected: </span>
-                      {tc.expected_result}
+                    <p className="mt-1 text-xs italic" style={{ color: "var(--text-2)" }}>
+                      Setup: {tc.preconditions.join("; ")}
                     </p>
                   )}
-                  <ol className="mt-2 space-y-1 text-xs text-slate-400">
-                    {tc.steps.map((step, i) => (
-                      <li key={i}>
-                        {i + 1}. {step}
-                      </li>
-                    ))}
-                  </ol>
-                </div>
-              ))
-            )}
-          </div>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          )}
+        </div>
 
-          <div className="mt-4 flex flex-wrap gap-3">
+        {/* Approve / Cancel — fixed at bottom when plan exists */}
+        {candidatePlan.length > 0 && status === "in_progress" && (
+          <div
+            className="flex gap-3 px-4 py-4 shrink-0"
+            style={{ borderTop: "1px solid var(--border)" }}
+          >
             <button
               type="button"
-              disabled={sending || candidatePlan.length === 0 || status !== "in_progress"}
+              disabled={sending}
               onClick={approve}
-              className="rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 px-5 py-2.5 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-50"
+              className="btn-primary btn-lg flex-1"
             >
-              Approve &amp; start run
+              Approve &amp; Run ({candidatePlan.length} test{candidatePlan.length !== 1 ? "s" : ""})
             </button>
             <button
               type="button"
-              disabled={sending || status !== "in_progress"}
+              disabled={sending}
               onClick={cancel}
-              className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-5 py-2.5 text-sm font-semibold text-rose-200 transition disabled:cursor-not-allowed disabled:opacity-50"
+              className="btn-ghost"
             >
               Cancel
             </button>
           </div>
-        </div>
-      </section>
+        )}
+      </div>
+      </motion.div>
     </div>
   );
 }

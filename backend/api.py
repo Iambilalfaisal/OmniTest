@@ -68,6 +68,7 @@ from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
 from .graph.discovery_graph import build_discovery_graph
+from .nodes.custom_plan import parse_custom_plan
 from .nodes.worker import (
     SESSION_REAP_INTERVAL_SECONDS,
     close_all_sessions,
@@ -195,6 +196,10 @@ class RunRequest(BaseModel):
     # and planning/review nodes are skipped (plan_approved is forced True).
     test_cases: list[dict] = []
     features: list[dict] = []
+    # "My own plan" mode, plain-English variant — used only when test_cases is empty.
+    # Parsed into structured test cases via one LLM call (nodes/custom_plan.py) instead
+    # of requiring the caller to hand-write valid TestCase JSON.
+    raw_plan_text: str = ""
 
 
 class RunHandle(BaseModel):
@@ -208,6 +213,7 @@ class ResumeRequest(BaseModel):
 class DiscoveryStartRequest(BaseModel):
     target_url: str
     starting_idea: str = ""
+    mode: Literal["explore", "quick"] = "explore"
 
 
 class DiscoveryMessageRequest(BaseModel):
@@ -418,12 +424,27 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
             plan_approved = True
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"Invalid test_cases payload: {exc}") from exc
+    elif req.raw_plan_text.strip():
+        try:
+            parsed_plan = await parse_custom_plan(
+                req.raw_plan_text,
+                req.target_url,
+                config={"callbacks": [llm_metrics.LlmUsageCallback(run_id)]},
+            )
+            raw = ensure_expected_result(ensure_unique_test_ids(parsed_plan.test_cases))
+            user_features, user_test_cases = ensure_features(parsed_plan.features, raw)
+            plan_approved = True
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Could not turn your description into test cases: {exc}"
+            ) from exc
 
     initial_state: QAState = {
         "target_url": req.target_url,
         "instruction": req.instruction,
         "discovery_context": req.discovery_context,
         "run_token": "",
+        "discovery_mode": None,
         "test_cases": user_test_cases,
         "features": user_features,
         "flow_reports": [],
@@ -663,6 +684,7 @@ async def start_discovery(req: DiscoveryStartRequest, request: Request) -> dict:
     initial_state: DiscoveryState = {
         "target_url": req.target_url,
         "starting_idea": req.starting_idea,
+        "mode": req.mode,
         "messages": [],
         "site_context": SiteMap(pages=[]),
         "extra_dives_used": 0,
@@ -779,6 +801,7 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
             "instruction": instruction,
             "discovery_context": discovery_context,
             "run_token": snapshot.values.get("run_token", ""),
+            "discovery_mode": snapshot.values.get("mode"),
             "test_cases": test_cases,
             "features": features,
             "flow_reports": [],

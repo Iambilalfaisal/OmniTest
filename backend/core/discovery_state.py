@@ -17,6 +17,14 @@ from .models import SiteMap, TestPlan
 class DiscoveryState(TypedDict):
     target_url: str
     starting_idea: str
+    # "explore" (default): multi-turn conversation, discovery_agent_node asks clarifying
+    # questions across turns. "quick": single-turn — DISCOVERY_QUICK_ADDENDUM
+    # (nodes/discovery.py) tells the model to propose a complete plan and set
+    # ready_to_run=true in this one turn rather than converse, and route_to_recon
+    # (graph/builder.py) skips the recon subgraph for a run that came from this mode —
+    # both exist to keep "quick" living up to its name rather than just changing the
+    # first prompt. Threaded into QAState.discovery_mode at approval time (api.py).
+    mode: Literal["explore", "quick"]
     messages: Annotated[list[AnyMessage], add_messages]
     site_context: SiteMap
     extra_dives_used: int

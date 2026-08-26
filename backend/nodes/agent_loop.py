@@ -57,8 +57,10 @@ class AskHumanInput(BaseModel):
     context: str | None = Field(default=None, description="Optional extra context to help them answer.")
     sensitive: bool = Field(
         default=False,
-        description="Set True if the expected answer is a secret (e.g. a password) so it's masked in the "
-        "UI and never echoed back verbatim in the final verdict.",
+        description="Set True ONLY if the expected answer is itself a secret (e.g. a password or API key), "
+        "so it's masked in the UI and never echoed back verbatim in the final verdict. False for every other "
+        "kind of question — yes/no confirmations, which value to use, whether an observed outcome is correct — "
+        "even if the surrounding topic involves credentials. Most questions are False.",
     )
 
 

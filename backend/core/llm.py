@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from enum import Enum
 
 # google-genai is the underlying Gemini SDK — a transitive dependency of
@@ -58,6 +59,19 @@ _GEMINI_RATE_LIMITER = InMemoryRateLimiter(
 # langchain-google-genai: it builds `HttpRetryOptions(attempts=max_retries)` verbatim) —
 # not "retries in addition to the original". 3 = original + 2 retries.
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+
+# `with_fallback()` is called fresh on every turn by every call site (e.g.
+# nodes/auth/nodes.py's auth_agent_node, one call per login turn) — a NEW
+# `_ChatModelWithFallback` with `_fallback=None`, so nothing about a just-discovered
+# primary outage otherwise survives from one turn to the next. Without this, a Gemini
+# outage (confirmed live: `gemini-3.5-flash-lite` returning 504 DEADLINE_EXCEEDED on
+# every attempt) makes EVERY turn of a multi-turn agent loop separately re-pay the full
+# GEMINI_MAX_RETRIES x LLM_CALL_TIMEOUT_SECONDS cost (~3 minutes) before falling back —
+# a login flow needing a dozen turns would take half an hour instead of the ~30s the
+# fallback model actually needs. Keyed by role (not call site) and process-global,
+# since the outage is a property of the provider/model, not of any one node.
+LLM_FALLBACK_COOLDOWN_SECONDS = float(os.getenv("LLM_FALLBACK_COOLDOWN_SECONDS", "120"))
+_last_primary_failure: dict[ModelRole, float] = {}
 
 
 class ModelRole(str, Enum):
@@ -226,19 +240,28 @@ class _ChatModelWithFallback:
         self._kwargs = kwargs
         self._fallback = None
 
+    def _use_fallback(self):
+        if self._fallback is None:
+            fallback_model = _build_fallback_model(self._role, temperature=self._temperature, **self._kwargs)
+            self._fallback = self._chain_fn(fallback_model)
+        return self._fallback
+
     async def ainvoke(self, *args, **kwargs):
+        last_failure = _last_primary_failure.get(self._role)
+        if last_failure is not None and time.monotonic() - last_failure < LLM_FALLBACK_COOLDOWN_SECONDS:
+            return await self._use_fallback().ainvoke(*args, **kwargs)
         try:
-            return await self._primary.ainvoke(*args, **kwargs)
+            result = await self._primary.ainvoke(*args, **kwargs)
+            _last_primary_failure.pop(self._role, None)
+            return result
         except Exception as exc:
             if not _is_fallback_worthy(exc):
                 raise
+            _last_primary_failure[self._role] = time.monotonic()
             logging.warning(
                 "%s role's primary model failed (%s) — falling back to OpenRouter", self._role.value, exc
             )
-            if self._fallback is None:
-                fallback_model = _build_fallback_model(self._role, temperature=self._temperature, **self._kwargs)
-                self._fallback = self._chain_fn(fallback_model)
-            return await self._fallback.ainvoke(*args, **kwargs)
+            return await self._use_fallback().ainvoke(*args, **kwargs)
 
 
 def with_fallback(role: ModelRole, chain_fn, *, temperature: float = 0.0, **kwargs):

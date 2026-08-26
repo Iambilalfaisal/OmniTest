@@ -59,6 +59,12 @@ def configure_logging() -> None:
                 # — only the rendered message is usable) and blind to the final,
                 # terminally-failed attempt (no log line fires for that one).
                 "google_genai._api_client": {"level": "INFO"},
+                # Every tool-bound Gemini call re-triggers this warning once per JSON
+                # Schema key it strips ($schema, additionalProperties — Gemini's
+                # function-calling schema doesn't support either). Purely cosmetic:
+                # the SDK already handles the stripping correctly, this just narrates
+                # it, in bulk, on every single turn.
+                "langchain_google_genai._function_utils": {"level": "ERROR"},
             },
         }
     )

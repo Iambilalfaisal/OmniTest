@@ -62,20 +62,27 @@ def route_after_plan_review(state: QAState) -> str:
 
 
 def route_to_recon(state: QAState, config: RunnableConfig):
-    """auth_setup_node's outgoing edge. When RECON_ENABLED and the plan has at least one
-    Feature, Sends one recon_node instance per Feature — each interactively explores
-    that Feature's real flows (nodes/recon/) BEFORE any worker touches the browser for
-    graded execution, since a strictly read-only crawl (nodes/planner_explore.py) can
-    never see a flow that sits behind a click. Otherwise routes straight to
-    recon_join_node, which is then a harmless no-op pass-through — this is what makes
-    RECON_ENABLED=false degrade to exactly today's behavior, not a parallel code path.
+    """auth_setup_node's outgoing edge. When RECON_ENABLED, the plan has at least one
+    Feature, and this run's mode is "explore" (QAState.discovery_mode — recon's whole
+    point is grounding scenarios in a deep per-Feature exploration, confirmed at ~2.5
+    minutes on a real run, and is opt-IN per mode rather than opt-out: "quick" wants a
+    single fast pass, and "My Own Plan" (discovery_mode=None — never went through
+    discovery at all) means the user already told us exactly what to test, so recon
+    silently adding MORE scenarios beyond that would defeat the entire point of that
+    mode, not just cost it extra tokens/time), Sends one recon_node instance per Feature
+    — each interactively explores that Feature's real flows (nodes/recon/) BEFORE any
+    worker touches the browser for graded execution, since a strictly read-only crawl
+    (nodes/planner_explore.py) can never see a flow that sits behind a click. Otherwise
+    routes straight to recon_join_node, which is then a harmless no-op pass-through —
+    this is what makes RECON_ENABLED=false (or a non-explore-mode run) degrade to
+    exactly today's behavior, not a parallel code path.
 
     Also pre-registers every Feature in core/progress.py as `exploring`, before any
     recon_node branch has actually started — same rationale as route_to_workers' own
     pre-registration below: without this, the SSE `progress` payload (api.py) would show
     nothing at all for however long recon takes, indistinguishable from a stalled run.
     """
-    if not RECON_ENABLED or not state.get("features"):
+    if not RECON_ENABLED or not state.get("features") or state.get("discovery_mode") != "explore":
         return "recon_join_node"
     run_id = config["configurable"]["thread_id"]
     for feature in state["features"]:
