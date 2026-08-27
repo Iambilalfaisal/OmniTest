@@ -230,6 +230,10 @@ def route_to_workers(state: QAState, config: RunnableConfig):
     """
     run_id = config["configurable"]["thread_id"]
     auth_state = state.get("auth_storage_state")
+    # Same conditional threading as auth_state immediately above, and for the identical
+    # reason — see core/state.py's QAState.authenticated_landing_url docstring for why a
+    # requires_auth worker needs this in addition to the restored session itself.
+    landing_url = state.get("authenticated_landing_url")
     sends = []
     for test in state["test_cases"]:
         progress.register(run_id, test.test_id, total_steps=len(test.steps))
@@ -240,6 +244,7 @@ def route_to_workers(state: QAState, config: RunnableConfig):
                     "target_url": state["target_url"],
                     "test_case": test,
                     "auth_storage_state": auth_state if test.requires_auth else None,
+                    "authenticated_landing_url": landing_url if test.requires_auth else None,
                 },
             )
         )

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -36,7 +37,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from ...core.llm import LLM_RETRY_POLICY, ModelRole, with_fallback
-from ...mcp.client import invoke_tool, invoke_tool_or_error_text
+from ...mcp.client import extract_eval_value, invoke_tool, invoke_tool_or_error_text
 from ..agent_loop import (
     ASK_HUMAN_TOOL_NAME,
     DEVIATION_POLICY,
@@ -114,11 +115,37 @@ def _session_key(config: RunnableConfig) -> str:
     return f"{config['configurable']['thread_id']}:{AUTH_SUBJECT_ID}"
 
 
+# A password-type textbox still visible on screen is the strongest, lowest-false-positive
+# signal available that the shared-login attempt did NOT actually reach an authenticated
+# state — a real app's authenticated pages essentially never render a live password input,
+# regardless of the site's own markup/URL conventions (unlike a URL-path check, which
+# would need per-site guessing). Matches Playwright's ARIA snapshot format, e.g.
+# `- textbox "Password" [ref=e6]`; role and accessible name can appear in either order
+# depending on the control's markup, so both orderings are checked.
+_PASSWORD_FIELD_RE = re.compile(
+    r"textbox[^\n]{0,80}password|password[^\n]{0,80}textbox", re.IGNORECASE
+)
+
+
+async def _looks_unauthenticated(tool_map: dict) -> bool:
+    """Best-effort check used by auth_save_node right before it would otherwise trust
+    whatever session state exists as "the shared login." Returns False (i.e. "go ahead
+    and save it") on any error taking the snapshot — this check exists to catch a KNOWN
+    failure mode (saving a still-on-the-login-page session as if it were authenticated),
+    not to become a new reason a session that might genuinely be fine gets discarded.
+    """
+    try:
+        snapshot = await invoke_tool_or_error_text(tool_map["browser_snapshot"], {})
+    except Exception:
+        return False
+    return bool(_PASSWORD_FIELD_RE.search(snapshot))
+
+
 async def auth_agent_node(state: AuthState, config: RunnableConfig) -> dict:
     # Checked first, before opening a browser, so the common no-auth-needed run pays
     # nothing for this subgraph — exactly like the node this replaces.
     if not any(tc.requires_auth for tc in state["test_cases"]):
-        return {"auth_storage_state": None, "pending_tool_calls": []}
+        return {"auth_storage_state": None, "authenticated_landing_url": None, "pending_tool_calls": []}
 
     # Wall-clock backstop (agent_loop.SCENARIO_DEADLINE_SECONDS), mirroring
     # nodes/worker/nodes.py's agent_node exactly — see that copy's comment for why this
@@ -140,7 +167,7 @@ async def auth_agent_node(state: AuthState, config: RunnableConfig) -> dict:
             "auth_agent_node: failed to open a Playwright session — requires_auth "
             "test cases in this run will fall back to running unauthenticated"
         )
-        return {"auth_storage_state": None, "pending_tool_calls": []}
+        return {"auth_storage_state": None, "authenticated_landing_url": None, "pending_tool_calls": []}
 
     # `messages` uses the `add_messages` reducer (append-only) — the seed below must be
     # returned alongside the response on turn 1 so it's actually persisted into state,
@@ -156,7 +183,7 @@ async def auth_agent_node(state: AuthState, config: RunnableConfig) -> dict:
                 "test cases in this run will fall back to running unauthenticated"
             )
             discard_session(key)
-            return {"auth_storage_state": None, "pending_tool_calls": []}
+            return {"auth_storage_state": None, "authenticated_landing_url": None, "pending_tool_calls": []}
 
         known_context = (
             state.get("discovery_context") or "No existing credentials were provided — sign up a new account."
@@ -233,6 +260,18 @@ async def auth_tool_node(state: AuthState, config: RunnableConfig) -> dict:
     except Exception as exc:
         logging.exception("auth_tool_node: failed to open a session — aborting auth setup")
         return {"pending_tool_calls": [], "abort_reason": f"could not open a browser session ({exc})"}
+    # Tool NAME only, never call["args"] — args are exactly where the credentials being
+    # typed into the login form live. Diagnostic-only: without this, the shared-login
+    # attempt's own turn-by-turn trajectory was completely invisible in the console log
+    # (its `messages` never reach any report — see this module's own docstring), so a
+    # run that burned its full AUTH_SETUP_MAX_TURNS budget gave no way to tell whether
+    # it was genuinely stuck, looping, or just slow, short of replaying a video/trace.
+    logging.info(
+        "auth_tool_node: run %s turn %d calling %s",
+        config["configurable"]["thread_id"],
+        state.get("turn_count", 0),
+        call["name"],
+    )
     # invoke_tool_or_error_text, not invoke_tool: this IS the tool-dispatch point, with
     # no enclosing try/except — a raise here would crash the whole run, not just fail
     # this subgraph (see mcp.client.invoke_tool's docstring).
@@ -266,7 +305,7 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
     try:
         handle, _, tool_map = await get_session(key, require_existing=True)
     except SessionGoneError:
-        return {"auth_storage_state": None}
+        return {"auth_storage_state": None, "authenticated_landing_url": None}
 
     abort_reason = state.get("abort_reason")
     if abort_reason:
@@ -283,9 +322,10 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
                 logging.exception("auth_save_node: failed to close the shared-login browser while aborting")
         discard_session(key)
         await handle.close()
-        return {"auth_storage_state": None}
+        return {"auth_storage_state": None, "authenticated_landing_url": None}
 
     auth_storage_state = None
+    authenticated_landing_url = None
     try:
         run_dir = run_dir_for(key)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -298,12 +338,50 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
         # for the shared-login setup, which is never shown as a graded test result.
         await stop_and_capture(tool_map, "browser_stop_tracing", run_dir / "trace.zip")
 
+        # Logged unconditionally regardless of outcome below — closes the observability
+        # gap that made two separate live runs indistinguishable from the console alone:
+        # did the shared login actually reach an authenticated page, and if so, which
+        # URL? extract_eval_value (mcp/client.py), not invoke_tool_or_error_text's plain
+        # str() — that stringifies the raw content-block list through repr(), which
+        # mangles every real newline in the wrapped "### Result" text into a literal
+        # backslash-n, confirmed live to make the value unparseable downstream. Best-
+        # effort: any failure here must never block the real save/no-save decision below.
+        try:
+            final_url = extract_eval_value(
+                await invoke_tool(tool_map["browser_evaluate"], {"function": "() => window.location.href"})
+            )
+        except Exception:
+            final_url = "(could not read)"
+        logging.info(
+            "auth_save_node: run %s shared-login attempt ended at %s",
+            config["configurable"]["thread_id"],
+            final_url,
+        )
+
         storage_state_tool = tool_map.get("browser_storage_state")
         if storage_state_tool is None:
             logging.error(
                 "auth_save_node: browser_storage_state tool missing — is the storage "
                 "capability enabled (see mcp/client.py's --config)? requires_auth test "
                 "cases in this run will fall back to running unauthenticated"
+            )
+        elif await _looks_unauthenticated(tool_map):
+            # CONFIRMED live: this node used to save+return whatever session state existed
+            # unconditionally, with no check that the login/signup attempt actually
+            # succeeded — a login that failed (wrong/missing credentials, a CAPTCHA, a
+            # site quirk the auth agent couldn't get past within AUTH_SETUP_MAX_TURNS)
+            # still produced a non-null auth_storage_state pointing at an unauthenticated
+            # session. Every requires_auth worker that restored it then got told "you are
+            # ALREADY logged in" (nodes/worker/nodes.py's agent_node) while actually
+            # looking at a login page it had no steps of its own to handle, with only
+            # ask_human left as a legitimate way out. Refusing to save here instead routes
+            # those cases through the ALREADY-correct unauthenticated degrade path.
+            logging.warning(
+                "auth_save_node: the shared-login attempt for run %s ended on what still "
+                "looks like a login/signup screen (a password field is still visible) — "
+                "not saving this as a valid session; requires_auth test cases in this run "
+                "will fall back to running unauthenticated",
+                config["configurable"]["thread_id"],
             )
         else:
             # browser_storage_state saves cookies/local storage to a FILE (confirmed
@@ -316,6 +394,15 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
             storage_state_path = AUTH_STATE_DIR / f"{config['configurable']['thread_id']}.json"
             await invoke_tool(storage_state_tool, {"filename": str(storage_state_path)})
             auth_storage_state = str(storage_state_path)
+            # Only set alongside a genuine save, in this same branch — restoring valid
+            # cookies into a requires_auth worker's browser does not guarantee its own
+            # steps' target_url shows authenticated content (confirmed live: a site whose
+            # root path is a public/marketing page regardless of session, only
+            # recognizing auth under a deeper path like "/dashboard"). agent_node
+            # (nodes/worker/nodes.py) uses this to redirect that worker's own first
+            # navigate step here instead, when it looks like a plain navigate to target_url.
+            if final_url and final_url != "(could not read)":
+                authenticated_landing_url = final_url
     except Exception:
         logging.exception(
             "auth_save_node: failed to capture the shared login's storage state — "
@@ -331,7 +418,7 @@ async def auth_save_node(state: AuthState, config: RunnableConfig) -> dict:
         discard_session(key)  # the shared login's browser work is done
         await handle.close()
 
-    return {"auth_storage_state": auth_storage_state}
+    return {"auth_storage_state": auth_storage_state, "authenticated_landing_url": authenticated_landing_url}
 
 
 def route_after_auth_agent(state: AuthState) -> str:

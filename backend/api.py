@@ -63,7 +63,14 @@ from .core.history import HistoryStore, make_history_store
 from .core.memory import drop_semantic_duplicates, make_store
 from .core.models import SiteMap, TestCase, TestPlan
 from .core.run_context import run_id_var
-from .core.run_planning import drop_duplicate_scenarios, ensure_expected_result, ensure_features, ensure_unique_test_ids
+from .core.run_planning import (
+    drop_duplicate_scenarios,
+    ensure_expected_result,
+    ensure_features,
+    ensure_requires_auth,
+    ensure_unique_test_ids,
+    redact_test_case_dict,
+)
 from .core.state import QAState
 from .graph.builder import build_graph
 from .graph.checkpointer import make_checkpointer
@@ -344,7 +351,15 @@ async def _drive(graph, input_, config: dict, history: HistoryStore) -> None:
 
 
 def _model_dump(value):
-    return value.model_dump() if hasattr(value, "model_dump") else value
+    dumped = value.model_dump() if hasattr(value, "model_dump") else value
+    # "steps" only exists on a dumped TestCase, never TestResult/Feature — this is every
+    # API response boundary that returns TestCase data to the frontend, so it's the one
+    # place redact_test_case_dict (core/run_planning.py) needs to run. Never applied to
+    # the TestCase objects actually driving execution (nodes/worker/nodes.py) — only to
+    # this freshly-dumped copy on its way out over the wire.
+    if isinstance(dumped, dict) and "steps" in dumped:
+        dumped = redact_test_case_dict(dumped)
+    return dumped
 
 
 def _pending_interrupts(snapshot) -> list[dict]:
@@ -432,6 +447,12 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
                 config={"callbacks": [llm_metrics.LlmUsageCallback(run_id)]},
             )
             raw = ensure_expected_result(ensure_unique_test_ids(parsed_plan.test_cases))
+            # Same defense-in-depth as the discovery/planner paths (core/run_planning.py's
+            # ensure_requires_auth docstring) — CUSTOM_PLAN_PARSE_PROMPT now asks the model
+            # to split a compound "test login, then do X" description into a separate
+            # login case plus a requires_auth=true case for X, but this catches it
+            # deterministically if the model still merges them into one case anyway.
+            raw = ensure_requires_auth(raw)
             user_features, user_test_cases = ensure_features(parsed_plan.features, raw)
             plan_approved = True
         except Exception as exc:
@@ -439,10 +460,23 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
                 status_code=422, detail=f"Could not turn your description into test cases: {exc}"
             ) from exc
 
+    # nodes/auth/nodes.py's auth_setup_node reads credentials ONLY from discovery_context —
+    # never from raw_plan_text or instruction. The frontend's "My Own Plan" free-text mode
+    # (page.tsx) never sends discovery_context at all, so any credentials the caller typed
+    # directly into their plan description (e.g. "log in with x@y.com / pass123, then...")
+    # never reached auth_setup_node — it saw "no credentials provided" and tried to sign up
+    # a throwaway account instead, which then failed to authenticate for any requires_auth
+    # test case. Confirmed live. raw_plan_text is exactly the same kind of freeform text
+    # discovery_context already is (auth_setup_node just reads it as text and looks for
+    # credentials in it, same as planner_node does with PLANNER_PROMPT's known_context) —
+    # falling back to it only when the caller didn't already supply an explicit
+    # discovery_context is a strict improvement, never a behavior change for a caller that did.
+    discovery_context = req.discovery_context or req.raw_plan_text
+
     initial_state: QAState = {
         "target_url": req.target_url,
         "instruction": req.instruction,
-        "discovery_context": req.discovery_context,
+        "discovery_context": discovery_context,
         "run_token": "",
         "discovery_mode": None,
         "test_cases": user_test_cases,
@@ -452,6 +486,7 @@ async def start_run(req: RunRequest, request: Request) -> RunHandle:
         "summary": {},
         "plan_approved": plan_approved,
         "auth_storage_state": None,
+        "authenticated_landing_url": None,
     }
     # Insert BEFORE firing _drive() so a client hitting GET /history immediately after
     # this call always sees the row.
@@ -725,7 +760,9 @@ async def get_discovery(discovery_id: str, request: Request) -> dict:
         "turn_count": snapshot.values.get("turn_count", 0),
         "max_turns": MAX_DISCOVERY_TURNS,
         "transcript": _discovery_transcript(snapshot.values.get("messages")),
-        "candidate_plan": [tc.model_dump() for tc in candidate_plan.test_cases] if candidate_plan else [],
+        "candidate_plan": (
+            [redact_test_case_dict(tc.model_dump()) for tc in candidate_plan.test_cases] if candidate_plan else []
+        ),
         "site_pages_explored": [{"url": p.url, "title": p.title} for p in site_context.pages],
     }
 
@@ -777,6 +814,11 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
         # actually funnels through before execution, so it stays defense in depth rather
         # than trusting an earlier turn's pass was never superseded by a later edit.
         test_cases = await drop_semantic_duplicates(test_cases)
+        # Same defense-in-depth reasoning, for requires_auth (core/run_planning.py's
+        # ensure_requires_auth docstring) — this is the one point every chat-approved run
+        # funnels through before execution, so it's corrected here even though
+        # discovery_agent_node's own per-turn pass (nodes/discovery.py) already tries.
+        test_cases = ensure_requires_auth(test_cases)
         features, test_cases = ensure_features(candidate_plan.features, test_cases)
         instruction = snapshot.values.get("starting_idea") or "(test plan authored via discovery chat)"
 
@@ -809,6 +851,7 @@ async def send_discovery_message(discovery_id: str, req: DiscoveryMessageRequest
             "summary": {},
             "plan_approved": True,
             "auth_storage_state": None,
+            "authenticated_landing_url": None,
         }
         try:
             await request.app.state.history.create_session(

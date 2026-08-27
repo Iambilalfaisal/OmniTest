@@ -63,14 +63,38 @@ from .session import SessionGoneError, discard_session, get_session, session_key
 # large slice of MAX_CONCURRENT_WORKERS x 20 requests/day producing nothing; 8 caps that
 # downside while multi-action turns keep a legitimate flow from actually needing more
 # turns to fit the same steps. Override via env if a specific site's flows need more.
-MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "10"))  # 10 base turns: enough to navigate + act + hit an auth wall + still have turns left to call ask_human
+# Raised from 10: CONFIRMED live that the earned-extension system (TURN_BUDGET_BONUS on
+# a self-reported `deviated` PROGRESS line, or rediscovery_node's replan bonus) requires
+# the model to actually SIGNAL that it deviated — and for a multi-step wizard it
+# discovers and adapts to gradually, turn by turn, in-context, it often never does
+# either: no `deviated` PROGRESS line, no `trigger_rediscovery` call. It just quietly
+# clicks through the extra tabs on its own initiative and silently burns the base budget
+# with nothing to trigger a bonus. Proof: a real run's console log showed EXACTLY 10 LLM
+# calls for a test case whose own final verdict narrated two separate "plan amendments"
+# — the deviation was real, but only ever reported retrospectively in the one-shot
+# verdict call's own `deviations`/`amended_steps` fields (nodes/worker/nodes.py's
+# Verdict model), never live. The earned-extension mechanisms remain in place for the
+# cases that DO signal (they still add on top of this base), but this base value is the
+# only lever that isn't contingent on the model reliably telling the system it needs
+# more room, so it's what actually protects a gradually-discovered multi-step flow.
+MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "16"))
 
-# Earned-extension budget (see agent_node/tool_node below): a worker starts at
-# MAX_TOOL_TURNS but gains TURN_BUDGET_BONUS turns, up to MAX_TOOL_TURNS_CEILING, each
-# time it actually handles a deviation or an ask_human answer lands — so the cost of
-# adapting only rises for the specific case that needed it, rather than raising the flat
-# cap (and therefore worst-case quota burn) for every case whether it deviates or not.
-MAX_TOOL_TURNS_CEILING = int(os.getenv("MAX_TOOL_TURNS_CEILING", "20"))
+# Earned-extension budget (see agent_node/rediscovery_node/tool_node below): a worker
+# starts at MAX_TOOL_TURNS but gains turns — up to this ceiling — each time it actually
+# handles a deviation, replans after discovering unanticipated structure, or an
+# ask_human answer lands — so the cost of adapting only rises for the specific case that
+# needed it, rather than raising the flat cap (and therefore worst-case quota burn) for
+# every case whether it deviates or not.
+#
+# Raised from 20: CONFIRMED live even after rediscovery_node's replan path started
+# granting its own (step-count-scaled) bonus — a genuine multi-tab creation wizard
+# (Project Info -> Add Members -> Roles and Tasks, each its own fill+Next) still ran
+# the case right up against this ceiling twice in a row, reaching progressively further
+# each time the budget mechanics were fixed but still falling short of the final submit
+# + verification step. The bonus formula scaling with discovered step count was already
+# working as intended; the ceiling itself was the remaining constraint capping how much
+# of that earned bonus a legitimately complex flow could actually receive.
+MAX_TOOL_TURNS_CEILING = int(os.getenv("MAX_TOOL_TURNS_CEILING", "30"))
 TURN_BUDGET_BONUS = int(os.getenv("TURN_BUDGET_BONUS", "5"))  # 5 gives enough turns to complete login + resume original test after ask_human
 
 # How many times in a row the SAME tool call (name + args) can repeat before tool_node
@@ -254,6 +278,18 @@ don't cover. Never end your turns without either having completed the goal or ha
 you gave up silently, which is worse than asking. Never quote a sensitive value (a password \
 or other secret a human gave you) verbatim in your final verdict — refer to it generically \
 instead (e.g. "the provided password").
+
+**Multi-step wizards with an unspecified required field**: some flows (e.g. a project- \
+creation wizard's "Add Members" or "Roles and Tasks" tab) require you to search for, \
+select, or type a SPECIFIC value — a person's name, a role, an ID — that your test's steps \
+and preconditions do NOT give you a concrete value for. Do NOT guess a name, do NOT \
+repeatedly search/scroll trying different values hoping one works, and do NOT keep \
+clicking through hoping the field turns out to be optional. The moment you notice a \
+required field with no value to give it, call `ask_human` immediately: ask exactly what \
+value to use, or whether that step/field can be skipped or left at its default. This is the \
+same rule as the login-wall case above, applied to any other required-but-unspecified \
+field — silently trying to push past it, or getting stuck retrying, wastes turns on a \
+decision only the reviewer can actually make.
 
 ## After ask_human returns — you MUST immediately act on the answer
 
@@ -461,6 +497,13 @@ class RediscoveryPlan(BaseModel):
     )
 
 
+# Matches a plain "Navigate to X" / "Go to X" step and captures the URL token
+# separately, so agent_node can substitute a different URL while leaving the step's
+# own phrasing (and any trailing text) untouched — see the effective_steps rewrite in
+# agent_node below for why.
+_NAVIGATE_STEP_URL_RE = re.compile(r"^((?:navigate|go)\s+to\s+)(\S+)(.*)$", re.IGNORECASE)
+
+
 async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_case = state["test_case"]
     test_id_var.set(test_case.test_id)  # see core/run_context.py — set per-node, not
@@ -518,23 +561,55 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         # unlikely) partial-degradation path, not a silent one.
         auth_state = state.get("auth_storage_state")
         set_storage_state_tool = tool_map.get("browser_set_storage_state")
+        auth_restored = False
         if test_case.requires_auth and auth_state and set_storage_state_tool is not None:
             try:
                 # auth_state is a file path (see nodes/auth/nodes.py) — confirmed against
                 # the installed @playwright/mcp's tool schema that browser_set_storage_state
                 # restores from a file via `filename`, not an inline blob.
                 await invoke_tool(set_storage_state_tool, {"filename": auth_state})
+                auth_restored = True
             except Exception:
                 logging.exception(
                     "agent_node: failed to inject shared auth storage state for %s — "
                     "steps will run unauthenticated",
                     test_case.test_id,
                 )
-        steps_block = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(test_case.steps))
+        # Redirect this case's own first navigate step to the authenticated landing URL
+        # auth_setup_node actually reached (nodes/auth/nodes.py), instead of leaving it
+        # pointed at plain target_url — CONFIRMED live: restoring valid session cookies
+        # does not guarantee target_url itself shows authenticated content (a site whose
+        # root path is a public/marketing page regardless of session, only recognizing
+        # auth under a deeper path like "/dashboard"), so the worker landed back on a
+        # login page despite a genuinely successful shared login. Only ever touches step
+        # 1, and only when it's actually a plain navigate step — every other step (which
+        # names the real UI action to test) is untouched.
+        effective_steps = test_case.steps
+        landing_url = state.get("authenticated_landing_url") if auth_restored else None
+        if landing_url and effective_steps:
+            match = _NAVIGATE_STEP_URL_RE.match(effective_steps[0])
+            if match:
+                effective_steps = [
+                    f"{match.group(1)}{landing_url}{match.group(3)}",
+                    *effective_steps[1:],
+                ]
+        steps_block = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(effective_steps))
+        # Gated on auth_restored, NOT test_case.requires_auth alone — the old version
+        # unconditionally told the model "you are already logged in" whenever a test case
+        # merely WANTED a shared session, even when auth_setup_node never established one
+        # (no credentials reached it, it hit its own deadline, a tool error) or the restore
+        # above failed. requires_auth cases are written with no login steps of their own —
+        # so a model told it's authenticated when it isn't lands on a real login wall it
+        # was explicitly instructed not to act on, with nothing in its own plan to fall
+        # back to, and only ask_human as a legitimate way out. Confirmed live: this is what
+        # produced the "test case keeps asking for credentials even though they were given
+        # at the start" reports — auth_setup_node's own credentials were fine, but its
+        # failure silently propagated as a false "already logged in" claim instead of the
+        # documented unauthenticated degrade path.
         auth_note = (
             "\nStarting state: you are ALREADY logged in as the shared test account — a valid session was "
             "restored into this browser before your first turn. Do not log in or sign up again."
-            if test_case.requires_auth
+            if auth_restored
             else ""
         )
         seed = [
@@ -559,7 +634,7 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         # even before any rediscovery has happened.
         init_adaptive_fields = {
             "objective": test_case.goal,
-            "working_steps": list(test_case.steps),
+            "working_steps": list(effective_steps),
             "plan_version": 0,
             "plan_history": [],
             "needs_rediscovery": False,
@@ -598,6 +673,18 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         outbound = [*outbound, HumanMessage(facts_block)]
 
     response = await model.ainvoke(outbound)
+
+    if not response.tool_calls:
+        # The single most useful line for diagnosing an early-stopping test case — logs
+        # the model's own text the moment it produces a turn with NO tool call, whatever
+        # the reason (thinks it's done, thinks it's blocked, genuinely finished). Full
+        # content, not truncated: this is the one signal that explains why a case ended
+        # turns short of its budget, and WORKER_SYSTEM_PROMPT's RULE #1 says this should
+        # only ever happen on the true final turn — every other occurrence is the bug.
+        logging.info(
+            "agent_node: run %s test=%s turn %d produced NO tool call — content: %r",
+            run_id, test_case.test_id, state.get("turn_count", 0), str(response.content or ""),
+        )
 
     # Earned turn-budget extension: WORKER_SYSTEM_PROMPT asks every turn to open with a
     # `PROGRESS: step=<n> status=<on_track|deviated> note=<...>` line; a `deviated` turn
@@ -644,33 +731,59 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
         # pausing; there's no human interaction to wait for.
         progress.resolve_last_mutation(run_id, test_case.test_id)
 
-    # ── Auth-wall reconsideration gate ────────────────────────────────────────
+    # ── No-tool-call reconsideration gate ─────────────────────────────────────
     # Fires when the model produced a text-only response (no tool calls) while turns
-    # remain in the budget AND the response text signals an auth/credential wall.
+    # remain in the budget. WORKER_SYSTEM_PROMPT's own RULE #1 says this should only
+    # ever happen on the true final turn — every other occurrence is the bug. Has an
+    # auth-specific branch (below) for the original confirmed case, and a generic
+    # fallback for the same failure shape on non-auth content: CONFIRMED live on a
+    # `create-project` run — turn 6 of a 16-turn budget produced `PROGRESS: step=3
+    # status=on_track note=Filling in project details form fields` with NO tool call,
+    # silently ending the test case mid-form despite 10 turns still available and the
+    # model's own note saying it was still working.
     #
-    # Root cause: the model consistently hits a login modal, "knows" it lacks
+    # Root cause (auth case): the model consistently hits a login modal, "knows" it lacks
     # credentials, and writes a text summary (going silently to verdict_node as
     # Blocked) instead of calling ask_human — even after multiple explicit prompt
     # instructions. This is a model-prior failure, not a prompt-following failure:
     # base models trained on typical QA automation strongly prefer "stop + report"
-    # over "ask the human for credentials."
+    # over "ask the human for credentials." The generic case looks like the same
+    # underlying prior applied more broadly: narrate a step, then stop instead of
+    # acting on it.
     #
     # Fix: one targeted extra model invocation with an unambiguous enforcement
     # message that leaves the model NO text-only exit path. Cost: one extra LLM
     # call, but only in this exact scenario (~once per auth-gated test case) — far
     # cheaper than silently marking a test Blocked without ever asking.
+    # Negative/security cases are EXCLUDED outright: WORKER_SYSTEM_PROMPT's own "CRITICAL
+    # for negative test cases" rule says a rejection (wrong password, invalid input, etc.)
+    # IS the passing outcome and the model should stop — including a text-only final
+    # response that happens to mention "password"/"credential"/"login" while describing
+    # that rejection. Letting this gate force an ask_human call there directly
+    # contradicts that rule and corrupts the test (the human's answer, and the login
+    # attempt that follows it, overwrites the very rejection state being graded).
     _next_turn = state.get("turn_count", 0) + 1  # what turn_count becomes after return
-    if not response.tool_calls and _next_turn <= turn_budget:
+    if not response.tool_calls and _next_turn <= turn_budget and test_case.category not in (
+        "negative",
+        "security",
+    ):
         _resp_lower = str(response.content or "").lower()
+        # Deliberately BLOCKING phrases only — NOT bare topical words like "login",
+        # "credential", "password", "authentication", "sign in". Those alone match a
+        # perfectly normal final report for a test that already SUCCEEDED (e.g.
+        # "reached the dashboard using the provided credentials"), which used to force
+        # a spurious ask_human demanding credentials again after login had already
+        # completed — confirmed live: every auth-adjacent test case, not just the ones
+        # genuinely stuck, was hitting this gate. Each phrase below only shows up when
+        # the model is actually giving up, not when it's reporting an outcome.
         _AUTH_SIGNALS = (
-            "login", "sign in", "sign up", "signup", "log in", "log-in",
-            "authentication", "credential", "password",
             "blocked", "cannot proceed", "can't proceed",
             "cannot complete", "can't complete",
             "not provided", "not given",
             "need to log", "need to sign",
             "requires auth", "require auth",
         )
+        _enforce = None
         if any(s in _resp_lower for s in _AUTH_SIGNALS):
             _enforce = HumanMessage(
                 content=(
@@ -688,11 +801,40 @@ async def agent_node(state: WorkerState, config: RunnableConfig) -> dict:
                     "tool call — nothing else."
                 )
             )
+        elif parsed_step is not None and parsed_step < len(test_case.steps):
+            # Generic fallback — deliberately gated on parsed_step (already extracted
+            # above from this same turn's PROGRESS line), NOT on "any no-tool-call
+            # response while budget remains": that broader condition was tried and
+            # CONFIRMED live to regress a genuinely-finished test case — user-login had
+            # already reached the dashboard and reported success at turn 7, but got
+            # rejected and re-prompted every turn through turn 12, restating the same
+            # completed outcome instead of finishing. A text-only response IS the
+            # intended terminal report (WORKER_SYSTEM_PROMPT RULE #1); only treat it as
+            # premature when the model's OWN step count says it isn't on the plan's
+            # last step yet — e.g. create-project's "step=3 status=on_track note=Filling
+            # in project details form fields" against a 4-step plan.
+            _enforce = HumanMessage(
+                content=(
+                    "[System enforcement — no tool call detected while turns remain.]\n\n"
+                    "Your own PROGRESS line says you are on step "
+                    f"{parsed_step} of {len(test_case.steps)} — the task is not finished, and "
+                    f"turns remain in your budget ({turn_budget - state.get('turn_count', 0)} left). "
+                    "A turn with no tool call is only allowed once the test case is genuinely "
+                    "complete. Call the next appropriate tool right now to continue — do NOT "
+                    "write more text. If you are truly blocked and need information from the "
+                    "reviewer, call `ask_human` instead. The ONLY acceptable response right now "
+                    "is a tool call."
+                )
+            )
+        # else: no auth signal, and either no PROGRESS line or its own step count says
+        # this is the plan's last step — a genuine final report. Leave response as-is,
+        # same as before this gate existed, so it proceeds straight to verdict_node.
+        if _enforce is not None:
             _retry = await model.ainvoke([*outbound, response, _enforce])
             if _retry.tool_calls:
                 logging.info(
                     "agent_node: reconsideration gate produced tool calls for %s "
-                    "(first response had none but signalled auth wall)",
+                    "(first response had none)",
                     test_case.test_id,
                 )
                 response = _retry
@@ -718,6 +860,16 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
     test_id_var.set(test_id)  # see agent_node's comment
     run_id = run_id_var.get()
     call, remaining = state["pending_tool_calls"][0], state["pending_tool_calls"][1:]
+    # Tool NAME only, never call["args"] — same reasoning and same value as
+    # auth_tool_node's identical line (nodes/auth/nodes.py): without this, a test case
+    # that stops early (a text-only response with unfinished steps, no tool call at all)
+    # was completely invisible turn-by-turn — only the final verdict's own retrospective
+    # summary showed anything, with no way to see what the agent actually did or when it
+    # first went quiet.
+    logging.info(
+        "tool_node: run %s test=%s turn %d calling %s",
+        run_id, test_id, state.get("turn_count", 0), call["name"],
+    )
 
     # ── trigger_rediscovery interception ──────────────────────────────────────
     # Must come BEFORE ask_human and review_if_risky — this tool is never in the MCP
@@ -1002,7 +1154,35 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
             '"type": "textbox", "value": "<value>"}, ...one entry per remaining field]})]'
         )
 
-    result_text += _stuck_nudge(state, call)
+    repeats = _recent_repeated_calls(state.get("messages", []), call)
+    result_text += _stuck_nudge(state, repeats)
+
+    # Deterministic, self-report-independent budget extension. CONFIRMED live (see
+    # nodes.py's turn-budget history) that every self-report mechanism — the PROGRESS
+    # `status=deviated` line, `trigger_rediscovery`, even the explicit last-turn
+    # ask_human nudge in _stuck_nudge below — can all fail to fire in the SAME run: a
+    # gradually-discovered multi-tab wizard where the model just keeps calling real,
+    # distinct tools without ever announcing it needs more room. Gating the bonus on an
+    # announcement that doesn't reliably come means the earned-extension system doesn't
+    # protect the exact case it was built for. Reuses `_stuck_nudge`'s own "not stuck"
+    # definition (`repeats + 1 < STUCK_REPEAT_THRESHOLD`) as positive evidence of genuine
+    # forward progress instead of inventing a separate threshold — `repeats == 0` was
+    # tried first and CONFIRMED live to never fire even once across two full runs:
+    # `_recent_repeated_calls` walks `state["messages"]`, whose LAST entry is always the
+    # very AIMessage that produced this `call` (added_messages already appended it before
+    # tool_node runs), so an ordinary single-call turn matches itself on the very first
+    # comparison — `repeats` is >= 1 for essentially every real call, never 0.
+    budget = state.get("turn_budget") or MAX_TOOL_TURNS
+    turn_count = state.get("turn_count", 0)
+    budget_update = {}
+    if repeats + 1 < STUCK_REPEAT_THRESHOLD and turn_count >= budget - 1 and budget < MAX_TOOL_TURNS_CEILING:
+        new_budget = min(budget + TURN_BUDGET_BONUS, MAX_TOOL_TURNS_CEILING)
+        logging.info(
+            "tool_node: run %s test=%s auto-extending turn_budget %d -> %d "
+            "(genuine progress, no repeated call)",
+            run_id, test_id, budget, new_budget,
+        )
+        budget_update = {"turn_budget": new_budget}
 
     return {
         "messages": [
@@ -1015,10 +1195,11 @@ async def tool_node(state: WorkerState, config: RunnableConfig) -> dict:
         "pending_tool_calls": remaining,
         "video_clips": new_clips,
         **deadline_update,
+        **budget_update,
     }
 
 
-def _stuck_nudge(state: WorkerState, call: dict) -> str:
+def _stuck_nudge(state: WorkerState, repeats: int) -> str:
     """Deterministic, contextual nudges appended to a tool result the moment a bad
     pattern is actually happening — same rationale as the browser_fill_form nudge
     above, which this codebase already confirmed lands far better than a rule stated
@@ -1031,9 +1212,10 @@ def _stuck_nudge(state: WorkerState, call: dict) -> str:
     check for "was this an error" would be guessing at a format that isn't contractual.
     The two checks below use only turn_count/turn_budget and the exact-repeat count,
     both already tracked deterministically regardless of what any tool result says.
+    `repeats` is computed once by the caller (tool_node also uses it to decide whether
+    to auto-extend the turn budget) rather than recomputed here.
     """
     parts = []
-    repeats = _recent_repeated_calls(state.get("messages", []), call)
     if repeats + 1 >= STUCK_REPEAT_THRESHOLD:
         parts.append(
             f"\n\n[You have called this exact action with the exact same arguments {repeats + 1} times in a "
@@ -1450,6 +1632,22 @@ async def rediscovery_node(state: WorkerState, config: RunnableConfig) -> dict:
             or state.get("current_expected_result")
             or _expected_result(test_case)
         )
+        # CONFIRMED live: a genuine replan here used to grant NO extra turns at all,
+        # unlike agent_node's other two earned-extension paths (a `deviated` PROGRESS
+        # line, an answered ask_human) — a multi-tab wizard the original plan never
+        # anticipated (e.g. "fill the form" turning into three separate tabs each with
+        # their own fields and a Next button) discovers real, concrete NEW work right
+        # here, deterministically, yet the test case kept running on whatever budget it
+        # already had and reliably ran out mid-wizard. Unlike the other two bonus paths,
+        # this one is NOT a fixed TURN_BUDGET_BONUS: the size of the just-discovered plan
+        # is a direct, available signal for how much MORE work is actually left, so the
+        # bonus scales with it (still floored at TURN_BUDGET_BONUS so a tiny replan gets
+        # at least the same bump the other paths do) — capped at MAX_TOOL_TURNS_CEILING
+        # like every other path, so this can never grant unbounded turns.
+        new_budget = min(
+            (state.get("turn_budget") or MAX_TOOL_TURNS) + max(TURN_BUDGET_BONUS, len(new_working_steps)),
+            MAX_TOOL_TURNS_CEILING,
+        )
         steps_block = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(new_working_steps))
         plan_message = HumanMessage(
             f"[PLAN UPDATED — {mutation_context}]\n"
@@ -1483,6 +1681,14 @@ async def rediscovery_node(state: WorkerState, config: RunnableConfig) -> dict:
             "plan_version": new_plan_version,
             "plan_history": new_plan_history,
             "current_expected_result": new_expected,
+            "turn_budget": new_budget,
+            # A real replan just happened via a genuine ask_human-free pause — mirrors
+            # why tool_node's ask_human path (agent_node) pushes deadline_at forward on
+            # its own extension: the wall-clock this rediscovery LLM call just spent
+            # would otherwise count against SCENARIO_DEADLINE_SECONDS the same as a stuck
+            # loop would, even though it's exactly the productive work the extra turn
+            # budget above is meant to pay for.
+            "deadline_at": new_deadline(),
         }
     else:
         # No replanning needed — inject an acknowledgement so the agent's message

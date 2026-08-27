@@ -23,6 +23,23 @@ Their description (may describe one test case or several — split it into one s
 test case per distinct test they described):
 {raw_text}
 
+If their description names login/authentication as ONE of the things to test, alongside \
+OTHER application behavior that isn't itself about auth (e.g. "test the login using these \
+creds X and Y, then create a project"), that is TWO distinct tests, not one — splitting \
+them is formatting what they already described, not inventing a case:
+1. A login/auth test case: requires_auth false, its own inline login steps using their \
+given credentials, expected_result about reaching the authenticated app.
+2. One test case per OTHER named capability (e.g. "create a project"): requires_auth true, \
+steps that assume you are ALREADY authenticated and start directly at that feature — do \
+NOT repeat the login steps in this case. A shared login (using the same credentials) is \
+established once, automatically, before any requires_auth case runs.
+Only keep login steps inline in a SINGLE combined case if their description genuinely \
+describes one continuous procedure with no other distinct capability under test (e.g. just \
+"test that login works") — do not merge login into a case that is really testing something \
+else, and do not invent a separate login test if they only mentioned credentials to let you \
+REACH a feature they actually asked you to test (e.g. "using these creds, test project \
+creation" describes ONE test — project creation, requires_auth true — not a login test too).
+
 For each test case, produce:
 - test_id: short, stable, lowercase-with-hyphens, derived from the behavior under test.
 - feature_id: name the small number of high-level features these cases cover (e.g. "login", \

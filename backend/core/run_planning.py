@@ -4,6 +4,7 @@ LangGraph/state-free so either caller can use them directly.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -151,3 +152,145 @@ def ensure_features(features: list[Feature], test_cases: list[TestCase]) -> tupl
         else:
             fixed_cases.append(tc.model_copy(update={"feature_id": features[0].feature_id}))
     return features, fixed_cases
+
+
+# Same class of gap as ensure_expected_result/ensure_features above: TEST_CASE_AUTHORING_
+# GUIDELINES (core/models.py) already tells the model, with a worked example, that a case
+# needing a logged-in start but NOT itself testing auth must set requires_auth=true and
+# skip writing its own login steps — nodes/auth/nodes.py's auth_setup_node exists
+# specifically to make that free. CONFIRMED live on gemini-3.5-flash-lite: a "create a
+# project" case still came back requires_auth=false with its own inline
+# navigate/click-sign-in/type-email/type-password/click-log-in prefix before the steps
+# that actually tested project creation — burning 4-5 of its 10-turn budget on a login
+# auth_setup_node would have handled for free, and running out of turns before ever
+# clicking Save. A prompt instruction alone was not enough; this is the deterministic
+# correction.
+#
+# Deliberately NOT applied to recon-discovered scenarios (graph/builder.py's
+# _test_case_from_scenario hardcodes requires_auth=False there on purpose — "recon writes
+# each scenario's OWN entry steps inline," a separate, intentional design choice for
+# scenarios discovered independently of the baseline plan) — only planner/discovery-
+# authored baseline cases go through this.
+_STEP_NAVIGATE_RE = re.compile(r"^(navigate|go)\s+to\b", re.IGNORECASE)
+_STEP_EMAIL_TYPE_RE = re.compile(
+    r"^type\s+'.*?'\s+into the\s+'?[^']*\b(email|username|user\s*id)\b[^']*'?\s*field", re.IGNORECASE
+)
+_STEP_PASSWORD_TYPE_RE = re.compile(
+    r"^type\s+'.*?'\s+into the\s+'?[^']*\bpassword\b[^']*'?\s*field", re.IGNORECASE
+)
+_STEP_LOGIN_CLICK_RE = re.compile(
+    r"^click the\s+'?[^']*\b(log\s*in|sign\s*in|login|signin)\b[^']*'?", re.IGNORECASE
+)
+# Used only to prune a stale "starts from login page..." precondition line off a rewritten
+# case below — NOT as a goal-based skip. A goal-text check ("does this goal mention
+# login?") was tried and dropped: a case that's genuinely about something else, but whose
+# goal is phrased "...after logging in..." (exactly the case this function exists to fix,
+# confirmed against the live example), would match it and wrongly skip the rewrite. The
+# real, sufficient protection against misfiring on a case that IS genuinely about auth is
+# the "steps left over after the login prefix" check below: a pure login/signup test's
+# steps consist entirely of that prefix, so prefix_len == len(steps) and nothing is
+# rewritten no matter what the goal says.
+_AUTH_MENTION_RE = re.compile(
+    r"\b(log(ging)?\s*(in|out)|sign(ing)?\s*(in|up|out)|password\s*reset|forgot\s*password)\b", re.IGNORECASE
+)
+
+
+def ensure_requires_auth(test_cases: list[TestCase]) -> list[TestCase]:
+    """Rewrites a planner/discovery-authored TestCase that (a) is not itself testing
+    auth and (b) opens with its own inline login sequence (navigate + type email/username
+    + type password + click a sign-in/log-in control) followed by MORE steps afterward —
+    into requires_auth=true with that redundant login prefix stripped, so it starts from
+    auth_setup_node's shared session instead of re-doing (and burning turn budget on) a
+    login every other requires_auth case gets for free.
+
+    Best-effort pattern match against TEST_CASE_AUTHORING_GUIDELINES' own mandated step
+    phrasing ("Type 'X' into the 'Y' field", "Click the 'Z' button") — not a general NLP
+    parse. A step written in some other shape simply isn't recognized and that case passes
+    through unchanged (fails safe: worst case is the original wasteful-but-correct inline
+    login survives, never a case incorrectly rewritten out of steps it still needs).
+    """
+    result = []
+    for tc in test_cases:
+        if tc.requires_auth:
+            result.append(tc)
+            continue
+
+        prefix_len = 0
+        has_email = has_password = has_submit = False
+        for step in tc.steps:
+            if _STEP_EMAIL_TYPE_RE.match(step):
+                has_email = True
+            elif _STEP_PASSWORD_TYPE_RE.match(step):
+                has_password = True
+            elif _STEP_LOGIN_CLICK_RE.match(step):
+                has_submit = True
+            elif _STEP_NAVIGATE_RE.match(step):
+                pass  # navigate is compatible with the login prefix but not itself a signal
+            else:
+                break
+            prefix_len += 1
+
+        if has_email and has_password and has_submit and prefix_len < len(tc.steps):
+            kept_preconditions = [p for p in tc.preconditions if not _AUTH_MENTION_RE.search(p)]
+            result.append(
+                tc.model_copy(
+                    update={
+                        "requires_auth": True,
+                        "steps": tc.steps[prefix_len:],
+                        "preconditions": [
+                            *kept_preconditions,
+                            "Runs already authenticated as the shared test account "
+                            "(auto-corrected: the planner had written its own redundant login steps here).",
+                        ],
+                    }
+                )
+            )
+        else:
+            result.append(tc)
+    return result
+
+
+# A quoted value typed into a password field is the one place a TestCase's own `steps`
+# necessarily contains a literal secret — the worker can only type a value written out
+# verbatim (TEST_CASE_AUTHORING_GUIDELINES' own rule), so an explicit auth-test case
+# (requires_auth=false, its own inline login) has no way to avoid it. That's fine for
+# EXECUTION (the worker genuinely needs the real value), but every API response that
+# returns TestCase data straight to the frontend was echoing it back in plain text —
+# confirmed live: the shared test account's real password visible in the plan/report UI.
+# Reuses the same quoted-value shape _STEP_PASSWORD_TYPE_RE already matches, but captures
+# the value itself (group 2) rather than just testing for the step's presence.
+_PASSWORD_STEP_VALUE_RE = re.compile(
+    r"^type\s+'(.*?)'\s+into the\s+'?[^']*\bpassword\b[^']*'?\s*field", re.IGNORECASE
+)
+
+
+def redact_test_case_dict(tc: dict) -> dict:
+    """Returns a copy of a (already `model_dump()`-ed) TestCase dict with any password
+    value found in its own `steps` scrubbed from `steps` and `preconditions` — for API
+    responses ONLY. Must never be applied to the TestCase object actually handed to
+    agent_node (nodes/worker/nodes.py): that copy needs the real value to type it. Not
+    applied to email/username values — those aren't secrets, and redacting them would
+    make an auth-test case's own displayed steps unreadable for no security benefit.
+
+    A no-op (returns `tc` unchanged) for the overwhelming majority of test cases, which
+    have no password step at all.
+    """
+    steps = tc.get("steps")
+    if not isinstance(steps, list):
+        return tc
+    secrets = {m.group(1) for step in steps if isinstance(step, str) for m in [_PASSWORD_STEP_VALUE_RE.match(step)] if m and m.group(1)}
+    if not secrets:
+        return tc
+
+    def _scrub(text):
+        if not isinstance(text, str):
+            return text
+        for secret in secrets:
+            text = text.replace(secret, "[redacted]")
+        return text
+
+    redacted = dict(tc)
+    redacted["steps"] = [_scrub(s) for s in steps]
+    if isinstance(tc.get("preconditions"), list):
+        redacted["preconditions"] = [_scrub(p) for p in tc["preconditions"]]
+    return redacted

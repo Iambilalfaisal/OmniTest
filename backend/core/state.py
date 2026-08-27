@@ -129,6 +129,19 @@ class QAState(TypedDict):
     # blob) — agent_node passes this same path straight back as browser_set_storage_state's
     # `filename`. Still just a plain, JSON-checkpointable string.
     auth_storage_state: Annotated[str | None, _keep_latest_auth_state]
+    # Set once alongside auth_storage_state, by the SAME auth_setup_node success path —
+    # the URL its browser was actually sitting on right after a real login succeeded
+    # (captured via window.location.href, nodes/auth/nodes.py). None under the same
+    # conditions auth_storage_state is None. Exists because restoring valid session
+    # cookies into a requires_auth worker's browser does NOT guarantee its own steps'
+    # target_url shows authenticated content — confirmed live: a site whose root path is
+    # a public/marketing page regardless of session, only recognizing auth under a
+    # deeper path (here, "/dashboard") the planner never independently discovered. Reuses
+    # _keep_latest_auth_state's reducer: same lifecycle as auth_storage_state (set once
+    # before the fan-out, every parallel worker branch carries an identical copy through
+    # to its own final state), so the same "N branches write the same value" rationale
+    # applies without needing a second, differently-named reducer.
+    authenticated_landing_url: Annotated[str | None, _keep_latest_auth_state]
 
 
 class WorkerState(TypedDict):
@@ -169,6 +182,10 @@ class WorkerState(TypedDict):
     # only when test_case.requires_auth is True; None otherwise. No reducer needed here:
     # unlike QAState's copy, nothing inside this subgraph ever rewrites it.
     auth_storage_state: str | None
+    # Same lifecycle/rationale as auth_storage_state immediately above — populated
+    # alongside it in the same Send() payload; see QAState's own copy's docstring for why
+    # this exists as a field distinct from auth_storage_state.
+    authenticated_landing_url: str | None
     # Wall-clock backstop (nodes/agent_loop.py's SCENARIO_DEADLINE_SECONDS) — a
     # time.monotonic() value agent_node sets on turn 1 and checks on every later turn,
     # short-circuiting to verdict_node as Blocked if exceeded. Pushed forward (not

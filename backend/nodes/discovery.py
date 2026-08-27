@@ -26,7 +26,13 @@ from ..core.discovery_state import DiscoveryState
 from ..core.llm import ModelRole, with_fallback
 from ..core.memory import drop_semantic_duplicates, get_cached_site_map, retrieve_memory_context, save_site_map
 from ..core.models import TEST_CASE_AUTHORING_GUIDELINES, DiscoveryTurn, SiteMap
-from ..core.run_planning import drop_duplicate_scenarios, ensure_expected_result, ensure_features, generate_run_token
+from ..core.run_planning import (
+    drop_duplicate_scenarios,
+    ensure_expected_result,
+    ensure_features,
+    ensure_requires_auth,
+    generate_run_token,
+)
 from ..mcp.client import open_playwright_session
 from .planner import PLANNER_CRAWL_MAX_DEPTH, PLANNER_CRAWL_MAX_PAGES
 from .planner_explore import crawl_site, format_site_map_for_prompt
@@ -236,6 +242,11 @@ async def discovery_agent_node(state: DiscoveryState, *, store: BaseStore | None
     # to catch the SAME failure worded differently rather than repeated verbatim.
     fixed_test_cases = ensure_expected_result(drop_duplicate_scenarios(turn.candidate_plan.test_cases))
     fixed_test_cases = await drop_semantic_duplicates(fixed_test_cases)
+    # Same live-confirmed structured-output gap as expected_result/features, for
+    # requires_auth (core/run_planning.py's ensure_requires_auth docstring) — corrected
+    # every turn so the review panel the user approves from already reflects it, not just
+    # the final approved run.
+    fixed_test_cases = ensure_requires_auth(fixed_test_cases)
     fixed_features, fixed_test_cases = ensure_features(turn.candidate_plan.features, fixed_test_cases)
     candidate_plan = turn.candidate_plan.model_copy(
         update={"test_cases": fixed_test_cases, "features": fixed_features}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -181,6 +182,33 @@ async def get_page_title(tools: list) -> str:
     tool_map = {tool.name: tool for tool in tools}
     result = await invoke_tool(tool_map["browser_evaluate"], {"function": "() => document.title"})
     return _coerce_text(result).strip()
+
+
+_EVAL_RESULT_BLOCK_RE = re.compile(r"### Result\s*\n(.*?)(?:\n### |\Z)", re.DOTALL)
+
+
+def extract_eval_value(result) -> str:
+    """`browser_evaluate`'s raw tool result wraps the JS return value in its own
+    markdown block — confirmed live against the installed @playwright/mcp:
+    `'### Result\\n"<value>"\\n### Ran Playwright code\\n```js\\n...`.
+
+    Must receive the RAW result from `invoke_tool` (a `list[{"type": "text", "text":
+    ...}]` content-block shape, confirmed live), NOT an already-`_coerce_text`/`str()`-ed
+    copy — `str()` on that list renders each block's `text` through `repr()`, which
+    turns every real newline into the two literal characters `\` `n`, and this
+    function's own regex (written against real newlines) would then silently fail to
+    match and fall through to returning the entire unparsed blob. Reading `result[0]
+    ["text"]` directly first avoids that repr round-trip entirely.
+    """
+    if isinstance(result, list) and result and isinstance(result[0], dict) and "text" in result[0]:
+        text = result[0]["text"]
+    else:
+        text = _coerce_text(result)
+    match = _EVAL_RESULT_BLOCK_RE.search(text)
+    value = match.group(1).strip() if match else text.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value
 
 
 async def list_page_links(tools: list) -> list[dict]:

@@ -26,6 +26,10 @@ class AuthState(TypedDict):
     pending_tool_calls: list[dict]
     turn_count: int
     auth_storage_state: str | None
+    # Set alongside auth_storage_state on a genuine login success — the URL auth_save_node
+    # found the browser sitting on right after login (core/state.py's QAState copy has the
+    # full rationale). None whenever auth_storage_state is None.
+    authenticated_landing_url: str | None
     # Mirrors WorkerState's fields of the same name (core/state.py) — same mechanism,
     # same rationale: a wall-clock deadline checked at the top of every auth_agent_node
     # turn, and an abort_reason set on a session-open timeout or exceeded deadline so

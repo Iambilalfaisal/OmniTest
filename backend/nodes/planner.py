@@ -18,6 +18,7 @@ from ..core.run_planning import (
     drop_duplicate_scenarios,
     ensure_expected_result,
     ensure_features,
+    ensure_requires_auth,
     ensure_unique_test_ids,
     generate_run_token,
 )
@@ -127,6 +128,10 @@ async def planner_node(state: QAState, *, store: BaseStore | None = None) -> dic
     # structured-output call restating a case in different words rather than verbatim
     # (core/memory.py's drop_semantic_duplicates docstring).
     test_cases = await drop_semantic_duplicates(test_cases)
+    # Same class of structured-output gap, for requires_auth (core/run_planning.py's
+    # ensure_requires_auth docstring) — corrects a case that should reuse auth_setup_node's
+    # shared session but was written with its own redundant inline login instead.
+    test_cases = ensure_requires_auth(test_cases)
     # Same class of gap, for Feature/feature_id (core/run_planning.py's ensure_features
     # docstring) — must run here, before route_to_recon (graph/builder.py) depends on
     # every test case's feature_id resolving to a real Feature.

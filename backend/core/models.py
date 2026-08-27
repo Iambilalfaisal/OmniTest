@@ -288,6 +288,13 @@ Go through every test case you wrote and confirm all of these. Fix any that fail
 - Is every element label one you actually saw in the accessibility tree or site map?
 - Does every value the worker must type appear literally, in quotes, in a step?
 - Is requires_auth false for every case that is itself testing signup/login/logout/reset?
+- For every OTHER case (not testing auth itself) that needs a logged-in starting point:
+  is requires_auth TRUE, and did you leave its own login steps OUT of `steps` entirely?
+  Writing "Navigate to the login page / Click Sign in / Type email / Type password /
+  Click Log in" as a case's first steps when that case is really about something else
+  (creating a project, updating a setting, ...) is wrong even if requires_auth also says
+  true — it burns that case's limited turn budget re-doing a login the shared session
+  already handles for free, often leaving too few turns to reach the thing being tested.
 - Do two cases that each create an account use DIFFERENT generated emails?
 - Is the happy path covered, plus the most important negative, edge-case and
   error-handling cases for the flows in scope?
